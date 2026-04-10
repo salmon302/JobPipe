@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobpipe"
+version = "0.1.0"
+description = "Local automated job scraping and prioritization pipeline"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+authors = [
+  { name = "JobPipe" }
+]
+dependencies = [
+  "playwright>=1.53.0",
+  "sentence-transformers>=3.0.1",
+  "numpy>=1.26.4",
+  "python-dateutil>=2.9.0.post0",
+  "win10toast-click>=0.1; platform_system == 'Windows'"
+]
+
+[project.optional-dependencies]
+resume = [
+  "mcp>=1.8.0"
+]
+
+gui = [
+  "PySide6>=6.7.2"
+]
+
+dev = [
+  "pytest>=8.3.2",
+  "pytest-asyncio>=0.24.0",
+  "ruff>=0.6.9"
+]
+
+[project.scripts]
+jobpipe = "jobpipe.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+
+target-version = "py311"

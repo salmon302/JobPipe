@@ -1,0 +1,68 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run JobPipe (module)",
+      "type": "python",
+      "request": "launch",
+      "module": "jobpipe",
+      "args": ["run-once", "--max-pages", "1"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      }
+    },
+    {
+      "name": "Run JobPipe (__main__)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/jobpipe/__main__.py",
+      "args": ["run-once", "--max-pages", "1"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      }
+    },
+    {
+      "name": "Run JobPipe GUI",
+      "type": "python",
+      "request": "launch",
+      "module": "jobpipe",
+      "args": ["gui", "--max-pages", "1"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      }
+    },
+    {
+      "name": "Debug tests (pytest)",
+      "type": "python",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["-q"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      }
+    },
+    {
+      "name": "Attach (debugpy)",
+      "type": "python",
+      "request": "attach",
+      "connect": {
+        "host": "localhost",
+        "port": 5678
+      }
+    }
+  ]
+}

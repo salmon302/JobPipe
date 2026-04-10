@@ -1,0 +1,218 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%\
+% Candidate: Seth Nenninger
+%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass[letterpaper,11pt]{article}
+
+% ----- PACKAGES -----
+\usepackage[empty]{fullpage}
+\usepackage[english]{babel}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{lmodern}
+
+% Ensure that the generated PDF is machine-readable/ATS-parsable
+\pdfgentounicode=1
+
+% ----- DOCUMENT GEOMETRY (ULTRA-TIGHT MARGINS) -----
+\geometry{
+    left=0.6in,
+    right=0.6in,
+    top=0.3in, 
+    bottom=0.3in
+}
+
+% ----- HYPERLINK SETUP -----
+\hypersetup{
+    colorlinks=true,
+    urlcolor=blue,
+    linkcolor=blue,
+    pdfborder={0 0 0}
+}
+\urlstyle{same}
+
+% ----- SECTION FORMATTING -----
+\titleformat{\section}{
+    \vspace{4pt}\scshape\raggedright\large 
+}{}{0em}{}[\color{black}\titlerule \vspace{-2pt}]
+\titlespacing{\section}{0pt}{4pt}{4pt}
+
+% ----- CUSTOM COMMANDS -----
+\newcommand{\resumeEntry}[4]{
+    \vspace{2pt}
+    \noindent\textbf{#1}\hfill{#2}
+    \newline
+    \noindent\textit{#3}\hfill\textit{#4}
+    \vspace{-3pt}
+}
+
+\newcommand{\resumeItemListStart}{\begin{itemize}[leftmargin=1.1em, itemsep=0pt, parsep=0pt, topsep=2pt]}
+\newcommand{\resumeItemListEnd}{\end{itemize}}
+
+% ----- DOCUMENT START -----
+\begin{document}
+
+%---------- HEADING ----------
+\begin{center}
+    \textbf{\Huge\scshape Seth Nenninger}
+    \vspace{5pt}
+    
+    Fort Myers, FL \quad | \quad \href{mailto:sethnenninger@gmail.com}{sethnenninger@gmail.com} \quad | \quad \href{https://www.linkedin.com/in/seth-nenninger-bb3897178/}{LinkedIn} \quad |  \quad GitHub: \href{https://github.com/salmon302}{github.com/salmon302}
+\end{center}
+
+%---------- PROFESSIONAL SUMMARY ----------
+\section{Professional Summary}
+\vspace{1pt}
+\noindent Software Engineer with a proven track record of developing high-performance applications, real-time simulation engines, and automated data pipelines. Adept at leveraging C++ and Python to build scalable solutions, with hands-on experience ensuring 100\% data integrity and strict quality assurance in highly regulated environments. Passionate about applying rigorous engineering principles to solve complex problems across enterprise systems, healthcare tech, and software infrastructure.
+
+%---------- SKILLS ----------
+\section{Skills}
+\vspace{3pt}
+\noindent\textbf{Core Languages:} \quad C++, Python, C\#, JavaScript, SQL, AVR Assembly
+\vspace{5pt}
+
+\noindent\textbf{Frameworks \& Libraries:} \quad React, FastAPI, Qt, Pandas, PyTorch, OpenGL, JUCE
+\vspace{5pt}
+
+\noindent\textbf{Infrastructure \& Tools:} \quad AWS (EC2), Docker, Ansible, Git, Linux, Jira
+\vspace{5pt}
+
+\noindent\textbf{Domain Expertise:} \quad Real-Time Engines, Quality Assurance (QA) Protocols, Regulatory Compliance (FDA/cGMP), Data Integrity
+\vspace{5pt}
+%---------- EDUCATION ----------
+\section{Education}
+    \resumeEntry
+        {Admitted to MS in Simulation \& Modeling}
+        {Aug 2026 – May 2028 (Expected)}
+        {University of Central Florida}
+        {Orlando, FL}
+        
+    \resumeEntry
+        {BS in Software Engineering}
+        {Aug 2021 – May 2026}
+        {Florida Gulf Coast University}
+        {Fort Myers, FL}
+        
+    \resumeEntry
+        {Coursework towards BS in Biochemistry}
+        {Aug 2020 – May 2021}
+        {Rochester Institute of Technology}
+        {Rochester, NY}
+
+%---------- WORK EXPERIENCE ----------
+\section{Work Experience}
+\resumeEntry
+        {Backend Engineer Intern}
+        {Aug 2025 - Present}
+        {Exonicus}
+        {Fort Myers, FL}
+    \resumeItemListStart
+        \item{Architected a LAN-based remote control system and dynamic shader parameter foundation for a real-time layered visualization tool (showcased at IMSH 2026 in partnership with Kitware).}
+        \item{Engineered the backend integration between a high-fidelity data engine and Unity, optimizing processing logic and state synchronization to guarantee a consistent 60 FPS performance.}
+        \item{Developed robust validation protocols and comprehensive technical documentation, successfully streamlining the handoff of core infrastructure modules to cross-functional teams.}
+    \resumeItemListEnd
+
+    \resumeEntry
+        {Biologics Processor \& QA Associate}
+        {Mar 2025 – Present}
+        {Grifols}
+        {Fort Myers, FL}
+    \resumeItemListStart
+        \item{Operate within a highly regulated environment, strictly adhering to Standard Operating Procedures (SOPs) and Good Manufacturing Practices (cGMP).}
+        \item{Process over 1,750 biological samples weekly with 99.8\% accuracy, maintaining zero compliance-related rejections during stringent quality assurance audits.}
+        \item{Maintain data integrity for over 3,000 sensitive records, ensuring full traceability, secure data handling, and compliance with federal standards.}
+    \resumeItemListEnd
+
+    \resumeEntry
+        {Research Assistant – NLP \& Data Analysis}
+        {Oct 2025 - Dec 2025}
+        {FGCU}
+        {Fort Myers, FL}
+    \resumeItemListStart
+        \item{Utilized Python (Pandas, SciPy, Scikit-learn) to process and analyze large datasets, identifying linguistic markers for predictive modeling.}
+        \item{Built automated data pipelines to perform cross-dataset comparisons, achieving a high statistical correlation (0.81) in context similarity analysis.}
+    \resumeItemListEnd
+    
+    \resumeEntry
+        {Student Life Safety Assistant}
+        {Jan 2022 – May 2023}
+        {Florida Gulf Coast University}
+        {Fort Myers, FL}
+    \resumeItemListStart
+        \item{Conducted rigorous inspections of critical infrastructure, ensuring university-wide compliance with safety codes and operational standards.}
+    \resumeItemListEnd
+
+%---------- PROJECTS ----------
+\section{Projects}
+    \resumeEntry
+        {DSATrain: AI-Powered Technical Interview Platform}
+        {July 2025 – Sep 2025}
+        {Personal Project (FastAPI, React)}
+        {Github: \href{https://github.com/salmon302/DSATrain}{salmon302/DSATrain}}
+    \resumeItemListStart
+        \item{Developed a full-stack application using FastAPI and React to provide intelligent, real-time feedback on user-submitted coding algorithms.}
+    \resumeItemListEnd
+
+    \resumeEntry
+        {Cloud Infrastructure Security Automation}
+        {Aug 2024 – Dec 2024}
+        {Academic Project (Ansible, AWS, Linux)}
+        {Portfolio: \href{https://salmon302.github.io/Resume/}{salmon302.github.io/Resume}}
+    \resumeItemListStart
+        \item{Deployed secure AWS EC2 infrastructure using Ansible playbooks for automated provisioning and security hardening.}
+        \item{Mitigated simulated cybersecurity attacks (SQL injection, DDoS) through robust system configuration and monitoring.}
+    \resumeItemListEnd
+
+    \resumeEntry
+        {Textbook Divider: OCR Automation Tool}
+        {May 2024 – Present}
+        {Personal Project (Python, Machine Learning)}
+        {GitHub: \href{https://github.com/salmon302/Textbook-Divider}{salmon302/Textbook-Divider}}
+    \resumeItemListStart
+        \item{Built an automated document processing tool using Tesseract OCR, achieving 99.2\% text extraction accuracy.}
+        \item{Optimized image processing algorithms to reduce processing time to 6.7 seconds per page, a 4x efficiency gain.}
+    \resumeItemListEnd
+
+    \resumeEntry
+        {PYXEngine: Real-Time Audio/DSP Platform}
+        {July 2025 – Sep 2025}
+        {Personal Project (Python, SuperCollider)}
+    \resumeItemListStart
+        \item{Architected a high-performance Python-based DSP engine integrating SuperCollider for real-time signal synthesis.}
+        \item{Implemented test automation and maintained extensive documentation, mirroring software development lifecycles used in commercial engineering.}
+    \resumeItemListEnd
+
+    \resumeEntry
+        {PumpSim: Medical Infusion Pump Simulation}
+        {Jan 2024 – May 2024}
+        {Academic Project (AVR Assembly, Embedded Systems)}
+        {Portfolio: \href{https://salmon302.github.io/Resume/}{salmon302/Portfolio}}
+    \resumeItemListStart
+        \item{Developed a functional simulation of a medical infusion pump using AVR Assembly on an Arduino microcontroller.}
+        \item{Programmed precise timing interrupts and user interface logic to simulate critical drug delivery mechanisms safely and accurately.}
+    \resumeItemListEnd
+
+%---------- AWARDS ----------
+\section{Awards}
+    \resumeEntry
+        {Best XR Game (Medical Training)}
+        {Dec 2025}
+        {I/ITSEC Serious Games Showcase \& Challenge}
+        {Orlando, FL}
+    \resumeItemListStart
+        \item{Awarded for "MilExTS," a VR Tactical Combat Casualty Care Trainer, recognizing excellence in simulation-based medical education.}
+    \resumeItemListEnd
+    
+    \resumeEntry
+        {Hertz Company Challenge Winner}
+        {Feb 2025}
+        {EagleHacks Hackathon}
+        {Fort Myers, FL}
+    \resumeItemListStart
+        \item{Won 1st Place for best utilization of proprietary datasets to create a scalable software solution.}
+    \resumeItemListEnd
+
+\end{document}

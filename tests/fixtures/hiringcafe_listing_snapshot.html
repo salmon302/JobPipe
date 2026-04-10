@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>HiringCafe Snapshot</title>
+  </head>
+  <body>
+    <main>
+      <section id="results">
+        <article data-job-id="123">
+          <a href="/jobs/123">Backend Engineer</a>
+          <div data-company>Acme</div>
+          <p data-description>Python, FastAPI, and SQL role.</p>
+          <time>2 days ago</time>
+        </article>
+
+        <article>
+          <a href="/jobs/456">Data Engineer</a>
+          <span class="company">Beta Labs</span>
+          <div class="description">Batch data pipelines and analytics.</div>
+          <time>2026-04-08T10:30:00Z</time>
+        </article>
+
+        <ul>
+          <li data-job-id="789">
+            <a href="/jobs/789">Platform Engineer</a>
+            <span class="company">Gamma Systems</span>
+            <p class="description">Kubernetes and AWS platform tooling.</p>
+            <span class="posted">3 hours ago</span>
+          </li>
+        </ul>
+      </section>
+
+      <nav>
+        <a rel="next" href="/jobs?page=2">Next</a>
+      </nav>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,5 @@
+playwright>=1.53.0
+sentence-transformers>=3.0.1
+numpy>=1.26.4
+python-dateutil>=2.9.0.post0
+win10toast-click>=0.1; platform_system == "Windows"
