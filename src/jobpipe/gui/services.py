@@ -1,16 +1,19 @@
+# Purpose: Provide GUI-facing services for ingest, dashboard, and resume actions.
+# Author: Seth Nenninger (GPT-5.2-Codex Agent)
+# Timestamp: 2026-05-12T00:00:00Z
+# Changelog: Remove scheduler/auth services and add ingest server helpers.
+
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from os import environ
 from pathlib import Path
-import sys
 
 from jobpipe.config import InvalidSettingsError, Settings
-from jobpipe.pipeline import RunSummary, run_once
+from jobpipe.ingest.server import IngestServer, IngestServerConfig
+from jobpipe.ingest.service import JobIngestService
 from jobpipe.resume.compiler import LatexCompileConfig, LatexCompileResult, compile_latex
 from jobpipe.resume.staging import StagedJobDescription, stage_job_description
-from jobpipe.scrapers.auth_state import evaluate_storage_state, StorageStateStatus
 from jobpipe.storage.db import connect, initialize_database
 from jobpipe.storage.models import JobRecord, NotificationAuditRecord, ScrapeRunRecord
 from jobpipe.storage.repository import JobRepository
@@ -19,13 +22,14 @@ from jobpipe.storage.repository import JobRepository
 _EDITABLE_ENV_KEYS = (
     "JOBPIPE_NOTIFICATION_THRESHOLD",
     "JOBPIPE_USER_YEARS_EXPERIENCE",
-    "JOBPIPE_SCHEDULE_INTERVAL_HOURS",
     "JOBPIPE_AUTO_STAGE_JOB_DESCRIPTION",
-    "JOBPIPE_REQUIRE_USABLE_AUTH_STATE",
-    "JOBPIPE_WELLFOUND_ENABLED",
-    "JOBPIPE_BUILTIN_ENABLED",
+    "JOBPIPE_INGEST_HOST",
+    "JOBPIPE_INGEST_PORT",
+    "JOBPIPE_INGEST_MAX_PAYLOAD_BYTES",
     "JOBPIPE_CRITICAL_SKILLS",
     "JOBPIPE_REJECT_TERMS",
+    "JOBPIPE_EMBED_BATCH_SIZE",
+    "JOBPIPE_SCORE_ASYNC",
 )
 
 
@@ -36,7 +40,6 @@ class DashboardSnapshot:
     notified_jobs: int
     above_threshold_jobs: int
     last_run: ScrapeRunRecord | None
-    auth_states: dict[str, StorageStateStatus]
 
 
 class JobPipeGuiService:
@@ -53,6 +56,22 @@ class JobPipeGuiService:
 
     def editable_env_file_path(self, env_file: Path | None = None) -> Path:
         return self._env_file_path(env_file)
+
+    def ingest_endpoint(self) -> str:
+        return f"http://{self._settings.ingest_host}:{self._settings.ingest_port}"
+
+    def create_ingest_server(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+    ) -> IngestServer:
+        config = IngestServerConfig(
+            host=host or self._settings.ingest_host,
+            port=port or self._settings.ingest_port,
+            max_payload_bytes=self._settings.ingest_max_payload_bytes,
+        )
+        service = JobIngestService(self._settings)
+        return IngestServer(config=config, service=service)
 
     def _prepare(self) -> None:
         self._settings.ensure_runtime_dirs()
@@ -86,19 +105,12 @@ class JobPipeGuiService:
 
         recent_runs = repository.list_recent_runs(limit=1)
 
-        auth_states = {
-            "HiringCafe": evaluate_storage_state(self._settings.hiringcafe_storage_state),
-            "Wellfound": evaluate_storage_state(self._settings.wellfound_storage_state),
-            "BuiltIn": evaluate_storage_state(self._settings.builtin_storage_state),
-        }
-
         return DashboardSnapshot(
             total_jobs=int(row["total_jobs"] or 0),
             queued_jobs=int(row["queued_jobs"] or 0),
             notified_jobs=int(row["notified_jobs"] or 0),
             above_threshold_jobs=int(row["above_threshold_jobs"] or 0),
             last_run=recent_runs[0] if recent_runs else None,
-            auth_states=auth_states,
         )
 
     def list_top_jobs(self, limit: int = 100) -> list[JobRecord]:
@@ -106,19 +118,64 @@ class JobPipeGuiService:
         repository = self._repository()
         return repository.list_top_jobs(limit=limit)
 
+    def get_jobs_and_companies_count(self) -> tuple[int, int]:
+        """Return (unique_job_count, unique_company_count)."""
+        self._prepare()
+        with connect(self._settings.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS job_count,
+                    COUNT(DISTINCT company) AS company_count
+                FROM jobs
+                """
+            ).fetchone()
+            return int(row["job_count"] or 0), int(row["company_count"] or 0)
+
+    def clear_jobs(self) -> int:
+        """Clear all jobs from the database. Returns the number of deleted jobs."""
+        self._prepare()
+        repository = self._repository()
+        return repository.clear_jobs()
+
     def list_recent_runs(self, limit: int = 100) -> list[ScrapeRunRecord]:
         self._prepare()
         repository = self._repository()
         return repository.list_recent_runs(limit=limit)
 
-    def list_recent_notifications(self, limit: int = 100) -> list[NotificationAuditRecord]:
+    def list_recent_notifications(
+        self,
+        limit: int = 100,
+    ) -> list[NotificationAuditRecord]:
         self._prepare()
         repository = self._repository()
         return repository.list_recent_notifications(limit=limit)
 
-    def run_pipeline_once(self, max_pages: int = 1) -> RunSummary:
+    def rescore_all_jobs(self) -> int:
+        """Re-score all jobs using current Master CV. Returns number of jobs scored."""
+        from jobpipe.pipeline import score_pending_jobs
+        from jobpipe.storage.models import ScrapeRunRecord
+
         self._prepare()
-        return asyncio.run(run_once(self._settings, max_pages=max_pages))
+        repository = self._repository()
+
+        # Create a dummy run_id for scoring
+        run_id = "gui-rescore"
+
+        # Reset scores to None so they get re-scored
+        with connect(self._settings.db_path) as conn:
+            conn.execute("UPDATE jobs SET match_score = NULL WHERE match_score IS NOT NULL")
+            conn.commit()
+
+        # Run scoring
+        summary = score_pending_jobs(
+            settings=self._settings,
+            repository=repository,
+            run_id=run_id,
+            limit=1000,
+        )
+
+        return summary.scored
 
     def default_resume_tex_path(self) -> Path:
         name = self._settings.resume_target_basename
@@ -135,7 +192,11 @@ class JobPipeGuiService:
         self._prepare()
         repository = self._repository()
 
-        threshold = self._settings.notification_threshold if minimum_score is None else minimum_score
+        threshold = (
+            self._settings.notification_threshold
+            if minimum_score is None
+            else minimum_score
+        )
         target_path = output_path or self._settings.job_description_path
         return stage_job_description(
             repository=repository,
@@ -156,6 +217,62 @@ class JobPipeGuiService:
             tex_path=target_tex,
             output_pdf_path=target_tex.with_suffix(".pdf"),
             config=config,
+        )
+
+    def approve_and_compile_resume(
+        self,
+        tex_path: Path | None = None,
+    ) -> LatexCompileResult:
+        """Approve the LaTeX content and compile to PDF (REQ-3.4).
+
+        This method is called after the user reviews and approves the LaTeX
+        in the GUI editor. It writes the approved content and compiles.
+
+        Args:
+            tex_path: Path to the .tex file (defaults to configured basename)
+
+        Returns:
+            LatexCompileResult with paths and attempt count
+        """
+        from jobpipe.resume.service import (
+            ApprovalRequiredError,
+            write_targeted_resume,
+        )
+
+        self._prepare()
+        target_tex = tex_path or self.default_resume_tex_path()
+
+        # Read the LaTeX content (already saved by the GUI before calling this)
+        if not target_tex.exists():
+            raise FileNotFoundError(f"TeX file not found: {target_tex}")
+
+        latex_content = target_tex.read_text(encoding="utf-8")
+
+        # Use write_targeted_resume with approved=True
+        # This will compile the PDF
+        output_dir = target_tex.parent
+        base_name = target_tex.stem  # filename without extension
+
+        config = LatexCompileConfig(
+            pdflatex_command=self._settings.resume_pdflatex_command,
+            retries=self._settings.resume_compile_retries,
+            timeout_seconds=self._settings.resume_compile_timeout_seconds,
+        )
+
+        result = write_targeted_resume(
+            tex_content=latex_content,
+            output_name=base_name,
+            output_dir=output_dir,
+            compile_config=config,
+            approved=True,  # User has approved
+            write_retries=self._settings.resume_write_retries,
+            default_base_name=self._settings.resume_target_basename,
+        )
+
+        return LatexCompileResult(
+            tex_path=result.tex_path,
+            pdf_path=result.pdf_path,
+            attempts=result.compile_attempts,
         )
 
     def load_editable_env_values(self, env_file: Path | None = None) -> dict[str, str]:
@@ -186,7 +303,7 @@ class JobPipeGuiService:
                 environ[key] = value
 
             candidate = Settings.from_env()
-            candidate.validate_scraping_runtime()
+            candidate.validate_runtime()
         except (InvalidSettingsError, ValueError) as exc:
             raise InvalidSettingsError(str(exc)) from exc
         finally:
@@ -216,37 +333,6 @@ class JobPipeGuiService:
         self._settings = Settings.from_env()
         return path
 
-    def scheduler_status(self, task_name: str = "JobPipeAggregator") -> TaskStatusResult:
-        return get_task_status(task_name)
-
-    def install_or_update_scheduler(
-        self,
-        task_name: str = "JobPipeAggregator",
-        interval_hours: int | None = None,
-        max_pages: int = 1,
-        start_time: str | None = None,
-        env_file: Path | None = None,
-    ):
-        interval = interval_hours or self._settings.schedule_interval_hours
-        root = self._project_root()
-        env_path = env_file or root / ".env"
-
-        return create_or_update_hourly_task(
-            task_name=task_name,
-            python_executable=Path(sys.executable),
-            project_root=root,
-            env_file=env_path,
-            interval_hours=interval,
-            max_pages=max_pages,
-            start_time=start_time,
-        )
-
-    def run_scheduler_now(self, task_name: str = "JobPipeAggregator") -> TaskActionResult:
-        return run_task_now(task_name)
-
-    def uninstall_scheduler(self, task_name: str = "JobPipeAggregator") -> TaskDeleteResult:
-        return remove_task(task_name)
-
     def _project_root(self) -> Path:
         cwd = Path.cwd()
         if (cwd / "src" / "jobpipe").exists():
@@ -264,17 +350,16 @@ class JobPipeGuiService:
         return {
             "JOBPIPE_NOTIFICATION_THRESHOLD": str(self._settings.notification_threshold),
             "JOBPIPE_USER_YEARS_EXPERIENCE": str(self._settings.user_years_experience),
-            "JOBPIPE_SCHEDULE_INTERVAL_HOURS": str(self._settings.schedule_interval_hours),
             "JOBPIPE_AUTO_STAGE_JOB_DESCRIPTION": str(
                 self._settings.auto_stage_job_description
             ).lower(),
-            "JOBPIPE_REQUIRE_USABLE_AUTH_STATE": str(
-                self._settings.require_usable_auth_state
-            ).lower(),
-            "JOBPIPE_WELLFOUND_ENABLED": str(self._settings.wellfound_enabled).lower(),
-            "JOBPIPE_BUILTIN_ENABLED": str(self._settings.builtin_enabled).lower(),
+            "JOBPIPE_INGEST_HOST": self._settings.ingest_host,
+            "JOBPIPE_INGEST_PORT": str(self._settings.ingest_port),
+            "JOBPIPE_INGEST_MAX_PAYLOAD_BYTES": str(self._settings.ingest_max_payload_bytes),
             "JOBPIPE_CRITICAL_SKILLS": ",".join(self._settings.critical_skills),
             "JOBPIPE_REJECT_TERMS": ",".join(self._settings.reject_terms),
+            "JOBPIPE_EMBED_BATCH_SIZE": str(self._settings.embed_batch_size),
+            "JOBPIPE_SCORE_ASYNC": str(self._settings.score_async).lower(),
         }
 
     def _read_env_file(self, path: Path) -> dict[str, str]:
@@ -322,3 +407,176 @@ class JobPipeGuiService:
         path.parent.mkdir(parents=True, exist_ok=True)
         content = "\n".join(updated_lines).strip()
         path.write_text(f"{content}\n" if content else "", encoding="utf-8")
+
+    # -------------------------------------------------------------------------
+    # Resume Variants Management
+    # -------------------------------------------------------------------------
+    def list_resume_variants(
+        self,
+        job_id: str | None = None,
+        target_company: str | None = None,
+        job_type: str | None = None,
+        page_length: int | None = None,
+        master_cv_hash: str | None = None,
+        ats_optimized: bool | None = None,
+        limit: int = 100,
+    ) -> list:
+        """List resume variants with optional filters."""
+        self._prepare()
+        repository = self._repository()
+        return repository.list_resume_variants(
+            job_id=job_id,
+            target_company=target_company,
+            job_type=job_type,
+            page_length=page_length,
+            master_cv_hash=master_cv_hash,
+            ats_optimized=ats_optimized,
+            limit=limit,
+        )
+
+    def get_variant_lineage(self, variant_id: int) -> list:
+        """Get the full lineage (parent chain) of a variant."""
+        self._prepare()
+        repository = self._repository()
+        return repository.get_variant_lineage(variant_id)
+
+    def get_variants_by_job(self, job_id: str) -> list:
+        """Get all variants for a specific job."""
+        self._prepare()
+        repository = self._repository()
+        return repository.get_variants_by_job(job_id)
+
+    def get_variant_by_id(self, variant_id: int):
+        """Get a specific variant by ID."""
+        self._prepare()
+        repository = self._repository()
+        return repository.get_resume_variant(variant_id)
+
+    def ats_optimize_variant(
+        self,
+        variant_id: int,
+        job_description: str | None = None,
+    ) -> dict:
+        """Optimize a resume variant for ATS compatibility."""
+        from jobpipe.resume.service import ats_optimize_resume
+
+        self._prepare()
+        repository = self._repository()
+
+        variant = repository.get_resume_variant(variant_id)
+        if variant is None:
+            raise ValueError(f"Variant {variant_id} not found")
+
+        # Read the LaTeX content
+        tex_path = Path(variant.tex_path)
+        if not tex_path.exists():
+            raise FileNotFoundError(f"TeX file not found: {tex_path}")
+
+        tex_content = tex_path.read_text(encoding="utf-8")
+
+        # Get job description if not provided
+        if job_description is None and variant.job_id:
+            job = repository.select_resume_target_job(0.0, variant.job_id)
+            if job:
+                job_description = job.description
+
+        if job_description is None:
+            raise ValueError("Job description is required for ATS optimization")
+
+        # Run ATS optimization
+        result = ats_optimize_resume(
+            tex_content=tex_content,
+            job_description=job_description,
+            gemini_api_key=self._settings.gemini_api_key,
+            gemini_model=self._settings.ats_optimization_model,
+            gemini_base_url=self._settings.gemini_base_url,
+        )
+
+        # Update variant with ATS results
+        pdf_path = None
+        if "optimized_content" in result and result["optimized_content"] != tex_content:
+            # Write optimized content
+            optimized_path = tex_path.with_stem(tex_path.stem + "_ats_optimized")
+            optimized_path.write_text(result["optimized_content"], encoding="utf-8")
+
+            # Compile optimized version
+            config = LatexCompileConfig(
+                pdflatex_command=self._settings.resume_pdflatex_command,
+                retries=self._settings.resume_compile_retries,
+                timeout_seconds=self._settings.resume_compile_timeout_seconds,
+            )
+            compile_result = compile_latex(
+                tex_path=optimized_path,
+                output_pdf_path=optimized_path.with_suffix(".pdf"),
+                config=config,
+            )
+            pdf_path = str(compile_result.pdf_path)
+
+        # Update variant record
+        repository.update_resume_variant(
+            variant_id=variant_id,
+            pdf_path=pdf_path,
+            ats_optimized=True,
+            ats_score=result.get("ats_score"),
+        )
+
+        return result
+
+    def ats_optimize_all_for_role(
+        self,
+        job_id: str | None = None,
+        target_company: str | None = None,
+    ) -> dict:
+        """Optimize all resume variants for a specific role/company."""
+        self._prepare()
+        repository = self._repository()
+
+        # Get all variants for this role/company
+        variants = repository.list_resume_variants(
+            job_id=job_id,
+            target_company=target_company,
+            limit=1000,
+        )
+
+        results = {
+            "total": len(variants),
+            "optimized": 0,
+            "failed": 0,
+            "details": [],
+        }
+
+        for variant in variants:
+            try:
+                result = self.ats_optimize_variant(
+                    variant_id=variant.id,
+                    job_description=None,  # Will be fetched from job_id
+                )
+                results["optimized"] += 1
+                results["details"].append({
+                    "variant_id": variant.id,
+                    "variant_name": variant.variant_name,
+                    "ats_score": result.get("ats_score"),
+                    "status": "success",
+                })
+            except Exception as exc:
+                results["failed"] += 1
+                results["details"].append({
+                    "variant_id": variant.id,
+                    "variant_name": variant.variant_name,
+                    "error": str(exc),
+                    "status": "failed",
+                })
+
+        return results
+
+    def list_master_cv_versions(self, limit: int = 50) -> list:
+        """List all Master CV versions."""
+        self._prepare()
+        repository = self._repository()
+        return repository.list_cv_versions(limit=limit)
+
+    def compute_current_cv_hash(self) -> str:
+        """Compute hash of current Master CV file."""
+        from jobpipe.resume.service import compute_master_cv_hash
+
+        return compute_master_cv_hash(self._settings.master_cv_path)

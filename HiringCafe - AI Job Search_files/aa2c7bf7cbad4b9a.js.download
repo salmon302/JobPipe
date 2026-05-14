@@ -1,0 +1,8 @@
+__turbopack_load_page_chunks__("/careers", [
+  "static/chunks/544c302bd3eef12f.js",
+  "static/chunks/bd48c42349cd1c15.js",
+  "static/chunks/d1ebcaa5742c65d6.js",
+  "static/chunks/f3c19e7ec015015e.js",
+  "static/chunks/174c743cb7ba7f58.js",
+  "static/chunks/turbopack-5e1f4e76e4d251e6.js"
+])

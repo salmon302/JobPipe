@@ -1,3 +1,8 @@
+# Purpose: Validate database migrations apply expected schema changes.
+# Author: Seth Nenninger (GPT-5.2-Codex Agent)
+# Timestamp: 2026-05-12T00:00:00Z
+# Changelog: Add standard file header for ingest transition.
+
 from __future__ import annotations
 
 import sqlite3
@@ -33,6 +38,21 @@ def test_initialize_database_applies_latest_schema_version(tmp_path) -> None:
     assert _column_exists(db_path, "jobs", "score_relevance") is True
     assert _column_exists(db_path, "jobs", "score_attainability") is True
     assert _column_exists(db_path, "jobs", "score_recency") is True
+    # Migration 5 columns
+    assert _column_exists(db_path, "jobs", "summary") is True
+    assert _column_exists(db_path, "jobs", "requirements") is True
+    assert _column_exists(db_path, "jobs", "location") is True
+    assert _column_exists(db_path, "jobs", "county") is True
+    assert _column_exists(db_path, "jobs", "compensation") is True
+    assert _column_exists(db_path, "jobs", "workplace_type") is True
+    assert _column_exists(db_path, "jobs", "employment_type") is True
+    assert _column_exists(db_path, "jobs", "department") is True
+    assert _column_exists(db_path, "jobs", "team") is True
+    assert _column_exists(db_path, "jobs", "views") is True
+    assert _column_exists(db_path, "jobs", "saves") is True
+    assert _column_exists(db_path, "jobs", "applications") is True
+    assert _column_exists(db_path, "jobs", "posted_at") is True
+    assert _column_exists(db_path, "jobs", "posted_ago") is True
 
 
 def test_initialize_database_upgrades_legacy_schema(tmp_path) -> None:
@@ -64,3 +84,18 @@ def test_initialize_database_upgrades_legacy_schema(tmp_path) -> None:
     assert _column_exists(db_path, "jobs", "score_relevance") is True
     assert _column_exists(db_path, "jobs", "score_attainability") is True
     assert _column_exists(db_path, "jobs", "score_recency") is True
+    # Migration 5 columns
+    assert _column_exists(db_path, "jobs", "summary") is True
+    assert _column_exists(db_path, "jobs", "requirements") is True
+    assert _column_exists(db_path, "jobs", "location") is True
+    assert _column_exists(db_path, "jobs", "county") is True
+    assert _column_exists(db_path, "jobs", "compensation") is True
+    assert _column_exists(db_path, "jobs", "workplace_type") is True
+    assert _column_exists(db_path, "jobs", "employment_type") is True
+    assert _column_exists(db_path, "jobs", "department") is True
+    assert _column_exists(db_path, "jobs", "team") is True
+    assert _column_exists(db_path, "jobs", "views") is True
+    assert _column_exists(db_path, "jobs", "saves") is True
+    assert _column_exists(db_path, "jobs", "applications") is True
+    assert _column_exists(db_path, "jobs", "posted_at") is True
+    assert _column_exists(db_path, "jobs", "posted_ago") is True

@@ -5,6 +5,11 @@ from pathlib import Path
 
 from jobpipe.config import Settings
 from jobpipe.resume.compiler import LatexCompileConfig, compile_latex
+from jobpipe.resume.gemini_client import (
+    GeminiAPIError,
+    GeminiClient,
+    create_gemini_client_from_settings,
+)
 from jobpipe.resume.service import (
     ApprovalRequiredError,
     write_targeted_resume as write_targeted_resume_document,
@@ -97,6 +102,80 @@ def create_resume_mcp_server(settings: Settings):
             "score": "n/a" if staged.score is None else f"{staged.score:.3f}",
             "output_path": str(staged.output_path),
         }
+
+    @server.tool()
+    def generate_resume_with_gemini(
+        output_name: str | None = None,
+        template_path: str | None = None,
+    ) -> dict[str, str]:
+        """Generate a targeted LaTeX resume using Gemini API.
+
+        Reads Master_CV.md and Job_Description.md, then uses Gemini to create
+        a tailored LaTeX resume. The output is saved to a .tex file for review.
+
+        Args:
+            output_name: Output file name (without extension, defaults to configured basename)
+            template_path: Optional path to LaTeX template file
+
+        Returns:
+            Dict with tex_path and status message
+        """
+        if not settings.gemini_api_key:
+            raise RuntimeError(
+                "Gemini API key not configured. Set JOBPIPE_GEMINI_API_KEY in .env"
+            )
+
+        # Read Master CV
+        if not settings.master_cv_path.exists():
+            raise RuntimeError(f"Master CV not found at: {settings.master_cv_path}")
+
+        master_cv = settings.master_cv_path.read_text(encoding="utf-8")
+        if not master_cv.strip():
+            raise RuntimeError(f"Master CV is empty at: {settings.master_cv_path}")
+
+        # Read Job Description
+        if not settings.job_description_path.exists():
+            raise RuntimeError(f"Job description not found at: {settings.job_description_path}")
+
+        job_description = settings.job_description_path.read_text(encoding="utf-8")
+        if not job_description.strip():
+            raise RuntimeError(f"Job description is empty at: {settings.job_description_path}")
+
+        # Optional template
+        latex_template = None
+        if template_path:
+            template_file = Path(template_path)
+            if template_file.exists():
+                latex_template = template_file.read_text(encoding="utf-8")
+
+        try:
+            # Create client and generate
+            client = create_gemini_client_from_settings(settings)
+            response = client.generate_resume(
+                master_cv=master_cv,
+                job_description=job_description,
+                latex_template=latex_template,
+            )
+
+            # Determine output path
+            name = output_name or settings.resume_target_basename
+            if not name.lower().endswith(".tex"):
+                name = f"{name}.tex"
+
+            output_path = settings.resume_output_dir / name
+            settings.resume_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Write LaTeX to file
+            output_path.write_text(response.text, encoding="utf-8")
+
+            return {
+                "tex_path": str(output_path),
+                "status": "generated",
+                "message": "Resume generated. Review the LaTeX file before compiling.",
+            }
+
+        except GeminiAPIError as exc:
+            raise RuntimeError(f"Gemini API error: {exc}") from exc
 
     @server.tool()
     def write_targeted_resume(

@@ -1,3 +1,8 @@
+# Purpose: Validate repository persistence and query behavior.
+# Author: Seth Nenninger (GPT-5.2-Codex Agent)
+# Timestamp: 2026-05-12T00:00:00Z
+# Changelog: Add standard file header for ingest transition.
+
 from datetime import datetime, timezone
 
 from jobpipe.storage.db import initialize_database

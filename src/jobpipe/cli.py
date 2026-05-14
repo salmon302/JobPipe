@@ -1,74 +1,27 @@
+# Purpose: Provide CLI entry points for ingest and resume workflows.
+# Author: Seth Nenninger (GPT-5.2-Codex Agent)
+# Timestamp: 2026-05-12T00:00:00Z
+# Changelog: Replace scraper/scheduler commands with ingest server command.
+
 from __future__ import annotations
 
 import argparse
-import asyncio
 import logging
 from pathlib import Path
 import sys
 
 from jobpipe.config import InvalidSettingsError, Settings, load_dotenv
+from jobpipe.ingest.server import run_ingest_server
 from jobpipe.logging_config import configure_logging
-from jobpipe.pipeline import MissingMasterCVError, RunAlreadyInProgressError, run_once
 from jobpipe.resume.compiler import LatexCompileConfig, LatexCompilationError, compile_latex
 from jobpipe.resume.mcp_server import run_resume_mcp_server
 from jobpipe.resume.service import ApprovalRequiredError, write_targeted_resume
 from jobpipe.resume.staging import ResumeTargetNotFoundError, stage_job_description
-from jobpipe.scrapers.auth_state import (
-    StorageStateStatus,
-    UnusableStorageStateError,
-    bootstrap_storage_state,
-    expected_cookie_domains,
-    evaluate_storage_state,
-)
-from jobpipe.scheduler.windows_task import (
-    create_or_update_hourly_task,
-    get_task_status,
-    remove_task,
-    run_task_now,
-)
 from jobpipe.storage.db import initialize_database
 from jobpipe.storage.repository import JobRepository
 
 LOGGER = logging.getLogger(__name__)
-_AUTH_PLATFORM_CHOICES = ("hiringcafe", "wellfound", "builtin")
-_SCRAPING_RUNTIME_COMMANDS = {
-    "run-once",
-    "install-schedule",
-    "auth-bootstrap",
-    "auth-status",
-    "auth-preflight",
-}
-
-
-def _log_storage_state_status(status: StorageStateStatus) -> None:
-    LOGGER.info(
-        (
-            "Storage state | path=%s exists=%s valid_json=%s cookies=%s "
-            "unexpired=%s session=%s usable=%s"
-        ),
-        status.path,
-        status.exists,
-        status.valid_json,
-        status.cookie_count,
-        status.unexpired_cookie_count,
-        status.session_cookie_count,
-        status.usable,
-    )
-    for issue in status.errors:
-        LOGGER.warning("Storage state issue: %s", issue)
-
-
-def _default_auth_platforms(settings: Settings, include_disabled: bool) -> list[str]:
-    if include_disabled:
-        return list(_AUTH_PLATFORM_CHOICES)
-
-    platforms = ["hiringcafe"]
-    if settings.wellfound_enabled:
-        platforms.append("wellfound")
-    if settings.builtin_enabled:
-        platforms.append("builtin")
-
-    return platforms
+_RUNTIME_COMMANDS = {"ingest-server", "gui"}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -84,8 +37,20 @@ def _build_parser() -> argparse.ArgumentParser:
     init_parser = subparsers.add_parser("init-db", help="Initialize SQLite schema")
     init_parser.add_argument("--db-path", type=Path, help="Override database path")
 
-    run_parser = subparsers.add_parser("run-once", help="Run one scrape + score cycle")
-    run_parser.add_argument("--max-pages", type=int, default=1, help="Max number of pages to scrape")
+    clear_parser = subparsers.add_parser("clear-db", help="Clear all jobs and runs data")
+    clear_parser.add_argument("--db-path", type=Path, help="Override database path")
+    clear_parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Must be supplied to confirm deletion",
+    )
+
+    ingest_parser = subparsers.add_parser(
+        "ingest-server",
+        help="Run the local ingest HTTP server",
+    )
+    ingest_parser.add_argument("--host", help="Override ingest host")
+    ingest_parser.add_argument("--port", type=int, help="Override ingest port")
 
     top_parser = subparsers.add_parser("top", help="Print top scored jobs")
     top_parser.add_argument("--limit", type=int, default=10, help="Rows to print")
@@ -99,98 +64,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     notifications_parser.add_argument("--limit", type=int, default=10, help="Rows to print")
 
-    schedule_parser = subparsers.add_parser(
-        "install-schedule",
-        help="Create or update a Windows Task Scheduler job",
+    db_stats_parser = subparsers.add_parser(
+        "db-stats",
+        help="Show database statistics (job counts, statuses)",
     )
-    schedule_parser.add_argument("--task-name", default="JobPipeAggregator")
-    schedule_parser.add_argument("--interval-hours", type=int, help="Run frequency in hours")
-    schedule_parser.add_argument("--start-time", help="Optional daily start time in HH:MM")
-    schedule_parser.add_argument("--max-pages", type=int, default=1)
-
-    status_parser = subparsers.add_parser(
-        "schedule-status",
-        help="Show current Windows Task Scheduler status for JobPipe",
-    )
-    status_parser.add_argument("--task-name", default="JobPipeAggregator")
-
-    run_now_parser = subparsers.add_parser(
-        "run-now",
-        help="Trigger a configured Windows Task Scheduler job immediately",
-    )
-    run_now_parser.add_argument("--task-name", default="JobPipeAggregator")
-
-    uninstall_parser = subparsers.add_parser(
-        "uninstall-schedule",
-        help="Delete a Windows Task Scheduler job",
-    )
-    uninstall_parser.add_argument("--task-name", default="JobPipeAggregator")
-
-    auth_bootstrap_parser = subparsers.add_parser(
-        "auth-bootstrap",
-        help="Interactively capture platform browser session state",
-    )
-    auth_bootstrap_parser.add_argument(
-        "--platform",
-        choices=_AUTH_PLATFORM_CHOICES,
-        default="hiringcafe",
-        help="Platform auth profile to capture",
-    )
-    auth_bootstrap_parser.add_argument("--base-url", help="Override platform base URL")
-    auth_bootstrap_parser.add_argument(
-        "--storage-state",
-        type=Path,
-        help="Override platform storage state file path",
-    )
-    auth_bootstrap_parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Launch browser headless during auth bootstrap",
-    )
-
-    auth_status_parser = subparsers.add_parser(
-        "auth-status",
-        help="Validate current platform storage state cookies",
-    )
-    auth_status_parser.add_argument(
-        "--platform",
-        choices=_AUTH_PLATFORM_CHOICES,
-        default="hiringcafe",
-        help="Platform auth profile to validate",
-    )
-    auth_status_parser.add_argument(
-        "--storage-state",
-        type=Path,
-        help="Override platform storage state file path",
-    )
-    auth_status_parser.add_argument(
-        "--base-url",
-        help="Override platform base URL for cookie domain validation",
-    )
-
-    auth_preflight_parser = subparsers.add_parser(
-        "auth-preflight",
-        help="Validate auth storage state for one or more platforms",
-    )
-    auth_preflight_parser.add_argument(
-        "--platform",
-        action="append",
-        choices=_AUTH_PLATFORM_CHOICES,
-        help="Platform auth profile(s) to validate (repeatable)",
-    )
-    auth_preflight_parser.add_argument(
-        "--include-disabled",
-        action="store_true",
-        help="When no --platform is provided, include disabled platforms in checks",
-    )
-    auth_preflight_parser.add_argument(
-        "--strict",
-        action="store_true",
-        help=(
-            "Return non-zero when any selected platform is unusable. "
-            "Defaults to JOBPIPE_REQUIRE_USABLE_AUTH_STATE when omitted."
-        ),
-    )
+    db_stats_parser.add_argument("--db-path", type=Path, help="Override database path")
 
     resume_stage_parser = subparsers.add_parser(
         "resume-stage",
@@ -233,20 +111,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to .tex file (defaults to configured basename in resume output dir)",
     )
 
+    resume_generate_parser = subparsers.add_parser(
+        "resume-generate",
+        help="Generate targeted LaTeX resume using Gemini API",
+    )
+    resume_generate_parser.add_argument(
+        "--output-name",
+        help="Output file name (without extension, defaults to configured basename)",
+    )
+    resume_generate_parser.add_argument(
+        "--template",
+        type=Path,
+        help="Optional LaTeX template file to guide generation",
+    )
+
     subparsers.add_parser(
         "resume-server",
         help="Run local MCP resume server for Claude Desktop",
     )
 
-    gui_parser = subparsers.add_parser(
+    subparsers.add_parser(
         "gui",
         help="Launch the local JobPipe desktop GUI",
-    )
-    gui_parser.add_argument(
-        "--max-pages",
-        type=int,
-        default=1,
-        help="Default max pages value for the Run Once action",
     )
 
     return parser
@@ -264,9 +150,9 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(args.env_file)
     settings = Settings.from_env()
 
-    if args.command in _SCRAPING_RUNTIME_COMMANDS:
+    if args.command in _RUNTIME_COMMANDS:
         try:
-            settings.validate_scraping_runtime()
+            settings.validate_runtime()
         except InvalidSettingsError as exc:
             LOGGER.error("%s", exc)
             return 2
@@ -277,27 +163,26 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.info("Database initialized at %s", db_path)
         return 0
 
-    if args.command == "run-once":
-        try:
-            summary = asyncio.run(run_once(settings, max_pages=args.max_pages))
-        except (
-            InvalidSettingsError,
-            RunAlreadyInProgressError,
-            MissingMasterCVError,
-            UnusableStorageStateError,
-        ) as exc:
-            LOGGER.error("%s", exc)
-            return 2
+    if args.command == "clear-db":
+        if not args.confirm:
+            LOGGER.error("Must supply --confirm to clear database")
+            return 1
+        db_path = args.db_path or settings.db_path
+        from jobpipe.storage.db import connect
+        with connect(db_path) as conn:
+            conn.execute("DELETE FROM notifications_audit")
+            conn.execute("DELETE FROM jobs")
+            conn.execute("DELETE FROM scrape_runs")
+            conn.commit()
+        LOGGER.info("Cleared all jobs and runs data from %s", db_path)
+        return 0
 
-        LOGGER.info(
-            "Run complete | scraped=%s inserted=%s updated=%s scored=%s above_threshold=%s notified=%s",
-            summary.scraped,
-            summary.inserted,
-            summary.updated,
-            summary.scored,
-            summary.above_threshold,
-            summary.notified,
-        )
+    if args.command == "ingest-server":
+        try:
+            run_ingest_server(settings, host=args.host, port=args.port)
+        except OSError as exc:
+            LOGGER.error("Ingest server failed: %s", exc)
+            return 2
         return 0
 
     if args.command == "top":
@@ -317,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 (
                     f"[{run.status}] {run.run_id} | started={run.started_at.isoformat()} "
-                    f"| finished={finished} | scraped={run.scraped} inserted={run.inserted} "
+                    f"| finished={finished} | ingested={run.scraped} inserted={run.inserted} "
                     f"updated={run.updated} scored={run.scored} "
                     f"above={run.above_threshold} notified={run.notified}{error}"
                 )
@@ -339,102 +224,6 @@ def main(argv: list[str] | None = None) -> int:
                     f"| {event.url}{error}"
                 )
             )
-        return 0
-
-    if args.command == "auth-bootstrap":
-        platform = args.platform
-        base_url = args.base_url or settings.platform_base_url(platform)
-        storage_state = args.storage_state or settings.platform_storage_state(platform)
-        platform_label = "Built In" if platform == "builtin" else platform.title()
-        LOGGER.info(
-            "Starting auth bootstrap | platform=%s base_url=%s storage_state=%s headless=%s",
-            platform,
-            base_url,
-            storage_state,
-            args.headless,
-        )
-        try:
-            result = asyncio.run(
-                bootstrap_storage_state(
-                    base_url=base_url,
-                    storage_state=storage_state,
-                    headless=args.headless,
-                    prompt_label=platform_label,
-                )
-            )
-        except KeyboardInterrupt:
-            LOGGER.warning("Auth bootstrap cancelled by user")
-            return 130
-        except RuntimeError as exc:
-            LOGGER.error("%s", exc)
-            return 2
-
-        _log_storage_state_status(result.status)
-        if not result.status.usable:
-            LOGGER.error(
-                "Captured storage state is not usable. Re-run auth-bootstrap and ensure login succeeds."
-            )
-            return 2
-
-        LOGGER.info("Auth bootstrap complete for %s", platform_label)
-        return 0
-
-    if args.command == "auth-status":
-        platform = args.platform
-        storage_state = args.storage_state or settings.platform_storage_state(platform)
-        base_url = args.base_url or settings.platform_base_url(platform)
-        status = evaluate_storage_state(
-            storage_state,
-            expected_domains=expected_cookie_domains(base_url),
-        )
-        _log_storage_state_status(status)
-        return 0 if status.usable else 1
-
-    if args.command == "auth-preflight":
-        selected_platforms = args.platform or _default_auth_platforms(
-            settings,
-            include_disabled=args.include_disabled,
-        )
-        strict = args.strict or settings.require_usable_auth_state
-
-        failing_platforms: list[str] = []
-        for platform in selected_platforms:
-            base_url = settings.platform_base_url(platform)
-            storage_state = settings.platform_storage_state(platform)
-            expected_domains = expected_cookie_domains(base_url)
-
-            LOGGER.info(
-                "Auth preflight | platform=%s storage_state=%s expected_domains=%s",
-                platform,
-                storage_state,
-                ",".join(expected_domains) if expected_domains else "n/a",
-            )
-
-            status = evaluate_storage_state(
-                storage_state,
-                expected_domains=expected_domains,
-            )
-            _log_storage_state_status(status)
-            if not status.usable:
-                failing_platforms.append(platform)
-
-        if failing_platforms:
-            LOGGER.warning(
-                "Auth preflight found unusable platform(s): %s",
-                ", ".join(failing_platforms),
-            )
-            if strict:
-                LOGGER.error(
-                    "Strict auth preflight failed. Run auth-bootstrap for each failing platform."
-                )
-                return 2
-
-        LOGGER.info(
-            "Auth preflight complete | checked=%s failing=%s strict=%s",
-            len(selected_platforms),
-            len(failing_platforms),
-            strict,
-        )
         return 0
 
     if args.command == "resume-stage":
@@ -539,6 +328,89 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.command == "resume-generate":
+        # Generate resume using Gemini API
+        from jobpipe.resume.gemini_client import (
+            GeminiAPIError,
+            create_gemini_client_from_settings,
+        )
+        from jobpipe.resume.service import write_targeted_resume as write_resume
+
+        if not settings.gemini_api_key:
+            LOGGER.error(
+                "Gemini API key not configured. Set JOBPIPE_GEMINI_API_KEY in .env file."
+            )
+            return 2
+
+        # Read Master CV
+        if not settings.master_cv_path.exists():
+            LOGGER.error("Master CV not found at: %s", settings.master_cv_path)
+            return 1
+
+        master_cv = settings.master_cv_path.read_text(encoding="utf-8")
+        if not master_cv.strip():
+            LOGGER.error("Master CV is empty at: %s", settings.master_cv_path)
+            return 1
+
+        # Read Job Description
+        if not settings.job_description_path.exists():
+            LOGGER.error("Job description not found at: %s", settings.job_description_path)
+            return 1
+
+        job_description = settings.job_description_path.read_text(encoding="utf-8")
+        if not job_description.strip():
+            LOGGER.error("Job description is empty at: %s", settings.job_description_path)
+            return 1
+
+        # Optional LaTeX template
+        latex_template = None
+        if args.template and args.template.exists():
+            latex_template = args.template.read_text(encoding="utf-8")
+
+        try:
+            # Create Gemini client
+            client = create_gemini_client_from_settings(settings)
+
+            # Check API health
+            if not client.health_check():
+                LOGGER.warning("Gemini API health check failed. Proceeding anyway...")
+
+            # Generate resume
+            LOGGER.info("Generating resume with Gemini API (%s)...", settings.gemini_model)
+            response = client.generate_resume(
+                master_cv=master_cv,
+                job_description=job_description,
+                latex_template=latex_template,
+            )
+
+            # Output path
+            output_name = args.output_name or settings.resume_target_basename
+            if not output_name.lower().endswith(".tex"):
+                output_name = f"{output_name}.tex"
+
+            output_path = settings.resume_output_dir / output_name
+
+            # Write LaTeX to file (not approved yet - user must review)
+            settings.resume_output_dir.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(response.text, encoding="utf-8")
+
+            LOGGER.info("Resume generated successfully!")
+            LOGGER.info("TeX file: %s", output_path)
+            LOGGER.info("")
+            LOGGER.info("Next steps:")
+            LOGGER.info("  1. Review the generated LaTeX: %s", output_path)
+            LOGGER.info("  2. Edit if needed")
+            LOGGER.info("  3. Compile with: jobpipe resume-write --input-tex %s --approved", output_path)
+
+            return 0
+
+        except GeminiAPIError as exc:
+            LOGGER.error("Gemini API error: %s", exc)
+            return 2
+        except Exception as exc:
+            LOGGER.error("Unexpected error: %s", exc)
+            return 2
+
     if args.command == "resume-server":
         try:
             run_resume_mcp_server(settings)
@@ -551,58 +423,52 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from jobpipe.gui.app import launch_gui
 
-            return launch_gui(settings=settings, default_max_pages=args.max_pages)
+            return launch_gui(settings=settings)
         except (ImportError, RuntimeError) as exc:
             LOGGER.error("%s", exc)
             return 2
 
-    if args.command == "install-schedule":
-        interval_hours = args.interval_hours or settings.schedule_interval_hours
-        result = create_or_update_hourly_task(
-            task_name=args.task_name,
-            python_executable=Path(sys.executable),
-            project_root=Path.cwd(),
-            env_file=args.env_file.resolve(),
-            interval_hours=interval_hours,
-            max_pages=args.max_pages,
-            start_time=args.start_time,
-        )
-        LOGGER.info(
-            "Scheduled task configured | task=%s interval_hours=%s",
-            result.task_name,
-            result.interval_hours,
-        )
-        LOGGER.info("Task run command: %s", result.run_command)
-        return 0
+    if args.command == "db-stats":
+        db_path = args.db_path or settings.db_path
+        from jobpipe.storage.db import connect
 
-    if args.command == "schedule-status":
-        result = get_task_status(args.task_name)
-        if not result.exists:
-            LOGGER.warning("Scheduled task not found | task=%s", args.task_name)
-            if result.stdout:
-                LOGGER.info(result.stdout)
-            return 1
+        with connect(db_path) as conn:
+            # Total jobs
+            total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
 
-        LOGGER.info("Scheduled task found | task=%s", args.task_name)
-        if result.stdout:
-            print(result.stdout)
-        return 0
+            # By status
+            status_rows = conn.execute(
+                "SELECT status, COUNT(*) as cnt FROM jobs GROUP BY status ORDER BY cnt DESC"
+            ).fetchall()
 
-    if args.command == "run-now":
-        result = run_task_now(args.task_name)
-        LOGGER.info("Scheduled task triggered | task=%s", args.task_name)
-        if result.stdout:
-            LOGGER.info(result.stdout)
-        return 0
+            # By platform
+            platform_rows = conn.execute(
+                "SELECT platform, COUNT(*) as cnt FROM jobs GROUP BY platform ORDER BY cnt DESC"
+            ).fetchall()
 
-    if args.command == "uninstall-schedule":
-        result = remove_task(args.task_name)
-        if result.deleted:
-            LOGGER.info("Scheduled task removed | task=%s", args.task_name)
-        else:
-            LOGGER.info("Scheduled task already absent | task=%s", args.task_name)
-        if result.stdout:
-            LOGGER.info(result.stdout)
+            # Recent runs
+            run_count = conn.execute("SELECT COUNT(*) FROM scrape_runs").fetchone()[0]
+
+            # Average score
+            avg_score = conn.execute(
+                "SELECT AVG(match_score) FROM jobs WHERE match_score IS NOT NULL"
+            ).fetchone()[0]
+
+        print(f"\n=== JobPipe Database Statistics ===")
+        print(f"Database: {db_path}")
+        print(f"\nTotal jobs: {total}")
+        print(f"Total runs: {run_count}")
+        print(f"Average match score: {avg_score:.3f}" if avg_score else "Average match score: n/a")
+
+        print(f"\n--- Jobs by Status ---")
+        for row in status_rows:
+            print(f"  {row['status']}: {row['cnt']}")
+
+        print(f"\n--- Jobs by Platform ---")
+        for row in platform_rows:
+            print(f"  {row['platform']}: {row['cnt']}")
+
+        print()
         return 0
 
     parser.print_help()

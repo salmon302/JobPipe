@@ -1,3 +1,8 @@
+# Purpose: Render the JobPipe desktop GUI for ingest monitoring and resume actions.
+# Author: Seth Nenninger (GPT-5.2-Codex Agent)
+# Timestamp: 2026-05-12T00:00:00Z
+# Changelog: Remove scraping scheduler UI and add ingest server status display.
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -6,16 +11,30 @@ import sys
 from typing import Callable
 
 from jobpipe.config import Settings
+from jobpipe.gui.latex_editor import LatexEditor
 from jobpipe.gui.services import DashboardSnapshot, JobPipeGuiService
+from jobpipe.ingest.server import IngestServer
 
 try:
-    from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QUrl, Signal
-    from PySide6.QtGui import QAction, QDesktopServices
+    from PySide6.QtCore import (
+        QEasingCurve,
+        QFileSystemWatcher,
+        QObject,
+        QPropertyAnimation,
+        QRunnable,
+        Qt,
+        QThreadPool,
+        QUrl,
+        Signal,
+    )
+    from PySide6.QtGui import QAction, QDesktopServices, QFont
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
         QCheckBox,
+        QFrame,
         QFormLayout,
+        QGridLayout,
         QHBoxLayout,
         QLabel,
         QLineEdit,
@@ -23,7 +42,8 @@ try:
         QMessageBox,
         QPlainTextEdit,
         QPushButton,
-        QSpinBox,
+        QSlider,
+        QSplitter,
         QTableWidget,
         QTableWidgetItem,
         QTabWidget,
@@ -52,33 +72,10 @@ def _is_truthy_env_value(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-class RunOnceSignals(QObject):
-    succeeded = Signal(object)
-    failed = Signal(str)
-    completed = Signal()
-
-
 class BackgroundActionSignals(QObject):
     succeeded = Signal(object)
     failed = Signal(str)
     completed = Signal()
-
-
-class RunOnceWorker(QRunnable):
-    def __init__(self, service: JobPipeGuiService, max_pages: int) -> None:
-        super().__init__()
-        self._service = service
-        self._max_pages = max_pages
-        self.signals = RunOnceSignals()
-
-    def run(self) -> None:
-        try:
-            summary = self._service.run_pipeline_once(max_pages=self._max_pages)
-            self.signals.succeeded.emit(summary)
-        except Exception as exc:
-            self.signals.failed.emit(str(exc))
-        finally:
-            self.signals.completed.emit()
 
 
 class BackgroundActionWorker(QRunnable):
@@ -98,79 +95,66 @@ class BackgroundActionWorker(QRunnable):
 
 
 class JobPipeMainWindow(QMainWindow):
-    def __init__(self, service: JobPipeGuiService, default_max_pages: int = 1) -> None:
+    def __init__(self, service: JobPipeGuiService) -> None:
         super().__init__()
         self._service = service
         self._thread_pool = QThreadPool(self)
-        self._run_in_progress = False
-        self._scheduler_busy = False
         self._resume_busy = False
-        self._current_worker: RunOnceWorker | None = None
-        self._current_scheduler_worker: BackgroundActionWorker | None = None
         self._current_resume_worker: BackgroundActionWorker | None = None
-        self._default_max_pages = max(1, default_max_pages)
+        self._ingest_server: IngestServer | None = None
+        self._intro_animation: QPropertyAnimation | None = None
 
-        self._max_pages_spin = QSpinBox()
-        self._run_once_button = QPushButton("Run Once")
-
-        self._scheduler_task_name_input = QLineEdit("JobPipeAggregator")
-        self._scheduler_interval_spin = QSpinBox()
-        self._scheduler_max_pages_spin = QSpinBox()
-        self._scheduler_start_time_input = QLineEdit()
-        self._scheduler_status_value = QLabel("Unknown")
-        self._scheduler_check_button = QPushButton("Check Status")
-        self._scheduler_install_button = QPushButton("Install / Update")
-        self._scheduler_run_now_button = QPushButton("Run Now")
-        self._scheduler_uninstall_button = QPushButton("Uninstall")
+        self._ingest_status_value = QLabel("Starting")
+        self._ingest_endpoint_value = QLabel("n/a")
 
         self._settings_env_path_value = QLabel()
         self._settings_notification_threshold_input = QLineEdit()
         self._settings_user_years_input = QLineEdit()
-        self._settings_schedule_interval_input = QLineEdit()
+        self._settings_ingest_host_input = QLineEdit()
+        self._settings_ingest_port_input = QLineEdit()
+        self._settings_ingest_payload_input = QLineEdit()
         self._settings_critical_skills_input = QLineEdit()
         self._settings_reject_terms_input = QLineEdit()
         self._settings_auto_stage_checkbox = QCheckBox("Enable auto-stage job description")
-        self._settings_require_auth_checkbox = QCheckBox("Require usable auth state")
-        self._settings_wellfound_enabled_checkbox = QCheckBox("Enable Wellfound scraper")
-        self._settings_builtin_enabled_checkbox = QCheckBox("Enable BuiltIn scraper")
         self._settings_reload_button = QPushButton("Reload")
         self._settings_save_button = QPushButton("Validate + Save")
         self._settings_status_value = QLabel("Not loaded")
+        self._settings_status_value.setProperty("role", "statusBadge")
 
         self._resume_job_id_input = QLineEdit()
         self._resume_min_score_input = QLineEdit()
         self._resume_stage_button = QPushButton("Stage Job Description")
         self._resume_output_path_value = QLabel("Not staged")
-        self._resume_preview = QPlainTextEdit()
-        self._resume_preview.setReadOnly(True)
+        # LaTeX editor for resume review (REQ-3.3)
+        self._resume_preview = LatexEditor()
         self._resume_tex_path_input = QLineEdit()
         self._resume_compile_button = QPushButton("Compile Resume")
+        self._resume_approve_button = QPushButton("Approve & Compile")  # REQ-3.4
         self._resume_open_pdf_button = QPushButton("Open Compiled PDF")
         self._resume_status_value = QLabel("Idle")
+        self._resume_status_value.setProperty("role", "statusBadge")
         self._resume_last_pdf_path: Path | None = None
 
-        self._db_path_value = QLabel()
-        self._threshold_value = QLabel()
-        self._counts_value = QLabel()
-        self._last_run_status_value = QLabel()
-        self._last_run_started_value = QLabel()
-        self._last_run_finished_value = QLabel()
-        self._last_run_summary_value = QLabel()
-
-        self._auth_hiringcafe_value = QLabel()
-        self._auth_wellfound_value = QLabel()
-        self._auth_builtin_value = QLabel()
+        self._db_path_value = QLabel("n/a")
+        self._threshold_value = QLabel("n/a")
+        self._counts_value = QLabel("n/a")
+        self._last_run_status_value = QLabel("n/a")
+        self._last_run_started_value = QLabel("n/a")
+        self._last_run_finished_value = QLabel("n/a")
+        self._last_run_summary_value = QLabel("n/a")
 
         self._jobs_table = self._create_table(
-            ["Score", "Title", "Company", "Platform", "Status", "Posted", "URL"]
+            ["Total", "Relevance", "Attainability", "Recency", "Title", "Company", "Platform", "Status", "Posted", "URL"]
         )
+        self._jobs_count_label = QLabel("Jobs: 0 | Companies: 0")
+        self._jobs_count_label.setProperty("role", "muted")
         self._runs_table = self._create_table(
             [
                 "Status",
                 "Run ID",
                 "Started",
                 "Finished",
-                "Scraped",
+                "Ingested",
                 "Inserted",
                 "Updated",
                 "Scored",
@@ -185,29 +169,306 @@ class JobPipeMainWindow(QMainWindow):
 
         self._log_output = QPlainTextEdit()
         self._log_output.setReadOnly(True)
+        self._log_output.setObjectName("logOutput")
 
         self.setWindowTitle("JobPipe Desktop")
         self.resize(1300, 800)
+        self._apply_theme()
         self._build_ui()
         self.statusBar().showMessage("Ready")
+        self._start_ingest_server()
         self.refresh_views()
         self._load_settings_form_values(silent=True)
 
-    def _build_ui(self) -> None:
-        central = QWidget(self)
-        root = QVBoxLayout(central)
+    def closeEvent(self, event) -> None:  # noqa: N802
+        if self._ingest_server is not None:
+            self._ingest_server.stop()
+        super().closeEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if self._intro_animation is not None:
+            return
+        self.setWindowOpacity(0.0)
+        animation = QPropertyAnimation(self, b"windowOpacity", self)
+        animation.setDuration(360)
+        animation.setStartValue(0.0)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.start()
+        self._intro_animation = animation
+
+    def _apply_theme(self) -> None:
+        app_font = QFont("Bahnschrift", 10)
+        QApplication.setFont(app_font)
+
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #f7f4ee, stop:1 #e6eef1);
+                color: #1e2a32;
+            }
+            #appRoot {
+                background: transparent;
+            }
+            #headerBar {
+                background: #ffffff;
+                border: 1px solid #e4d8cc;
+                border-radius: 12px;
+            }
+            #pageTitle {
+                font-size: 22px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+            }
+            #pageSubtitle {
+                color: #5c6b74;
+            }
+            QMenuBar {
+                background: #f6f0ea;
+                border-bottom: 1px solid #e4d8cc;
+            }
+            QMenuBar::item {
+                background: transparent;
+                padding: 6px 10px;
+                color: #1e2a32;
+            }
+            QMenuBar::item:selected {
+                background: #1f6f8b;
+                color: #ffffff;
+                border-radius: 6px;
+            }
+            QMenu {
+                background: #ffffff;
+                border: 1px solid #e4d8cc;
+            }
+            QMenu::item {
+                padding: 6px 12px;
+            }
+            QMenu::item:selected {
+                background: #1f6f8b;
+                color: #ffffff;
+            }
+            QStatusBar {
+                background: #f6f0ea;
+                border-top: 1px solid #e4d8cc;
+                color: #1e2a32;
+            }
+            QStatusBar::item {
+                border: 0;
+            }
+            QTabWidget::pane {
+                background: #ffffff;
+                border: 1px solid #e4d8cc;
+                border-radius: 8px;
+                padding: 8px;
+            }
+            QTabBar::tab {
+                background: #f2ede7;
+                color: #2b3a42;
+                border: 1px solid #e4d8cc;
+                border-bottom: 0;
+                padding: 7px 12px;
+                margin-right: 4px;
+            }
+            QTabBar::tab:selected {
+                color: #ffffff;
+                background: #1f6f8b;
+                border-color: #1f6f8b;
+            }
+            QTabBar::tab:!selected {
+                margin-top: 2px;
+            }
+            QTabBar::tab:hover {
+                background: #efe6dc;
+            }
+            QFrame[role="card"],
+            QFrame[role="metricCard"] {
+                background: #ffffff;
+                border: 1px solid #e4d8cc;
+                border-radius: 10px;
+            }
+            QFrame[role="chip"] {
+                background: #f6f0ea;
+                border: 1px solid #e4d8cc;
+                border-radius: 10px;
+            }
+            QLabel[role="chipLabel"] {
+                font-size: 9pt;
+                color: #6e7a83;
+            }
+            QLabel[role="chipValue"] {
+                font-weight: 700;
+                color: #1e2a32;
+            }
+            QLabel#cardTitle {
+                font-size: 10pt;
+                font-weight: 600;
+                color: #4b5d6a;
+            }
+            QLabel#metricTitle {
+                font-size: 9pt;
+                font-weight: 600;
+                color: #6e7a83;
+            }
+            QLabel[role="metricValue"] {
+                font-size: 13pt;
+                font-weight: 700;
+            }
+            QLabel[role="statusBadge"] {
+                background: #f6f0ea;
+                border: 1px solid #e4d8cc;
+                border-radius: 8px;
+                padding: 4px 8px;
+                font-weight: 600;
+                color: #1e2a32;
+            }
+            QLabel[role="muted"] {
+                color: #6e7a83;
+            }
+            QLineEdit, QPlainTextEdit, QTableWidget {
+                background: #ffffff;
+                border: 1px solid #d9cfc4;
+                border-radius: 8px;
+                padding: 6px;
+                selection-background-color: #1f6f8b;
+                color: #1e2a32;
+            }
+            QPlainTextEdit#detailsText {
+                background: #fbf7f2;
+            }
+            QHeaderView::section {
+                background: #efe8df;
+                color: #2b3a42;
+                border: 0;
+                border-bottom: 1px solid #d9cfc4;
+                padding: 6px;
+                font-weight: 600;
+            }
+            QTableWidget {
+                gridline-color: #e7ddd3;
+                alternate-background-color: #fbf7f2;
+            }
+            QPushButton {
+                background: #ffffff;
+                border: 1px solid #cbbfb4;
+                border-radius: 8px;
+                padding: 6px 12px;
+                color: #1e2a32;
+            }
+            QPushButton:hover {
+                background: #f2ece6;
+            }
+            QPushButton#primaryButton {
+                background: #1f6f8b;
+                color: #ffffff;
+                border-color: #1f6f8b;
+            }
+            QPushButton#primaryButton:hover {
+                background: #1b6078;
+            }
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #e6ddd3;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #1f6f8b;
+                border: 1px solid #1b6078;
+                width: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }
+            """
+        )
+
+    def _build_header(self) -> QWidget:
+        header = QFrame()
+        header.setObjectName("headerBar")
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(12)
 
         title = QLabel("JobPipe Control Center")
         title.setObjectName("pageTitle")
-        root.addWidget(title)
+        subtitle = QLabel("Ingest and resume operations")
+        subtitle.setObjectName("pageSubtitle")
+
+        left = QVBoxLayout()
+        left.addWidget(title)
+        left.addWidget(subtitle)
+        layout.addLayout(left)
+
+        layout.addStretch(1)
+
+        status_wrap = QWidget()
+        status_layout = QHBoxLayout(status_wrap)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(8)
+        status_layout.addWidget(self._build_stat_chip("Ingest", self._ingest_status_value))
+        status_layout.addWidget(self._build_stat_chip("Endpoint", self._ingest_endpoint_value))
+        layout.addWidget(status_wrap)
+
+        return header
+
+    def _build_stat_chip(self, label_text: str, value_label: QLabel) -> QWidget:
+        chip = QFrame()
+        chip.setProperty("role", "chip")
+        chip_layout = QVBoxLayout(chip)
+        chip_layout.setContentsMargins(14, 10, 14, 10)
+        chip_layout.setSpacing(4)
+
+        label = QLabel(label_text)
+        label.setProperty("role", "chipLabel")
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        value_label.setProperty("role", "chipValue")
+        value_label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+        value_label.setMinimumHeight(20)
+
+        chip_layout.addWidget(label)
+        chip_layout.addWidget(value_label)
+        return chip
+
+    def _build_metric_card(self, title: str, value_label: QLabel) -> QWidget:
+        card = QFrame()
+        card.setProperty("role", "metricCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("metricTitle")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        value_label.setProperty("role", "metricValue")
+        value_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        value_label.setMinimumHeight(24)
+        value_label.setMinimumHeight(24)
+
+        layout.addWidget(title_label)
+        layout.addWidget(value_label)
+        return card
+
+    def _build_ui(self) -> None:
+        central = QWidget(self)
+        central.setObjectName("appRoot")
+        root = QVBoxLayout(central)
+        root.setContentsMargins(18, 16, 18, 18)
+        root.setSpacing(12)
+
+        root.addWidget(self._build_header())
 
         tabs = QTabWidget()
+        tabs.setObjectName("mainTabs")
+        tabs.setDocumentMode(True)
+        tabs.setUsesScrollButtons(True)
         tabs.addTab(self._build_dashboard_tab(), "Dashboard")
         tabs.addTab(self._build_jobs_tab(), "Jobs")
         tabs.addTab(self._build_runs_tab(), "Runs")
         tabs.addTab(self._build_notifications_tab(), "Notifications")
-        tabs.addTab(self._build_scheduler_tab(), "Scheduler")
         tabs.addTab(self._build_resume_tab(), "Resume")
+        tabs.addTab(self._build_resume_variants_tab(), "Resume Variants")
+        tabs.addTab(self._build_cv_editor_tab(), "Master CV")
         tabs.addTab(self._build_settings_tab(), "Settings")
         tabs.addTab(self._build_logs_tab(), "Logs")
         root.addWidget(tabs)
@@ -229,36 +490,43 @@ class JobPipeMainWindow(QMainWindow):
     def _build_dashboard_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
+
+        metrics = QGridLayout()
+        metrics.setHorizontalSpacing(12)
+        metrics.setVerticalSpacing(12)
+        metrics.addWidget(
+            self._build_metric_card("Notification Threshold", self._threshold_value), 0, 0
+        )
+        metrics.addWidget(
+            self._build_metric_card("Tracked Jobs", self._counts_value), 0, 1
+        )
+        metrics.addWidget(
+            self._build_metric_card("Last Run Status", self._last_run_status_value), 1, 0
+        )
+        metrics.addWidget(
+            self._build_metric_card("Last Run Finished", self._last_run_finished_value), 1, 1
+        )
+        layout.addLayout(metrics)
 
         form = QFormLayout()
         form.addRow("Database Path", self._db_path_value)
-        form.addRow("Notification Threshold", self._threshold_value)
-        form.addRow("Tracked Job Counts", self._counts_value)
-        form.addRow("Last Run Status", self._last_run_status_value)
         form.addRow("Last Run Started", self._last_run_started_value)
-        form.addRow("Last Run Finished", self._last_run_finished_value)
         form.addRow("Last Run Summary", self._last_run_summary_value)
-
-        form.addRow(QLabel(""))  # Spacer
-        form.addRow("HiringCafe Login", self._auth_hiringcafe_value)
-        form.addRow("Wellfound Login", self._auth_wellfound_value)
-        form.addRow("BuiltIn Login", self._auth_builtin_value)
-
-        layout.addLayout(form)
+        details_card = QFrame()
+        details_card.setProperty("role", "card")
+        details_layout = QVBoxLayout(details_card)
+        details_layout.setContentsMargins(12, 10, 12, 10)
+        details_title = QLabel("System Details")
+        details_title.setObjectName("cardTitle")
+        details_layout.addWidget(details_title)
+        details_layout.addLayout(form)
+        layout.addWidget(details_card)
 
         controls = QHBoxLayout()
-        self._max_pages_spin.setRange(1, 25)
-        self._max_pages_spin.setValue(self._default_max_pages)
-        controls.addWidget(QLabel("Max Pages"))
-        controls.addWidget(self._max_pages_spin)
-
-        self._run_once_button.clicked.connect(self._run_once_clicked)
-        controls.addWidget(self._run_once_button)
-
         refresh_button = QPushButton("Refresh")
         refresh_button.clicked.connect(self.refresh_views)
         controls.addWidget(refresh_button)
-
         controls.addStretch(1)
         layout.addLayout(controls)
         layout.addStretch(1)
@@ -267,6 +535,13 @@ class JobPipeMainWindow(QMainWindow):
     def _build_jobs_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
+
+        # Counts label
+        counts_layout = QHBoxLayout()
+        counts_layout.addWidget(self._jobs_count_label)
+        counts_layout.addStretch(1)
+        layout.addLayout(counts_layout)
 
         controls = QHBoxLayout()
         refresh_button = QPushButton("Refresh")
@@ -277,92 +552,145 @@ class JobPipeMainWindow(QMainWindow):
         open_button.clicked.connect(self._open_selected_job_url)
         controls.addWidget(open_button)
 
+        clear_button = QPushButton("Clear Jobs")
+        clear_button.clicked.connect(self._clear_jobs)
+        controls.addWidget(clear_button)
+
         controls.addStretch(1)
         layout.addLayout(controls)
-        layout.addWidget(self._jobs_table)
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self._jobs_table)
+
+        # Job details panel
+        details_panel = QFrame()
+        details_panel.setProperty("role", "card")
+        details_layout = QVBoxLayout(details_panel)
+        details_layout.setContentsMargins(12, 10, 12, 10)
+        details_label = QLabel("Job Details")
+        details_label.setObjectName("cardTitle")
+        self._job_details_text = QPlainTextEdit()
+        self._job_details_text.setObjectName("detailsText")
+        self._job_details_text.setReadOnly(True)
+        self._job_details_text.setPlaceholderText("Select a job to view details...")
+        details_layout.addWidget(details_label)
+        details_layout.addWidget(self._job_details_text)
+
+        splitter.addWidget(details_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter)
+
+        # Connect selection change to show details
+        self._jobs_table.selectionModel().selectionChanged.connect(self._on_job_selection_changed)
+
         return widget
 
     def _build_runs_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
 
         refresh_button = QPushButton("Refresh")
         refresh_button.clicked.connect(self.refresh_views)
-        layout.addWidget(refresh_button)
+        controls = QHBoxLayout()
+        controls.addWidget(refresh_button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
         layout.addWidget(self._runs_table)
         return widget
 
     def _build_notifications_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
 
         refresh_button = QPushButton("Refresh")
         refresh_button.clicked.connect(self.refresh_views)
-        layout.addWidget(refresh_button)
-        layout.addWidget(self._notifications_table)
-        return widget
-
-    def _build_scheduler_tab(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-
-        self._scheduler_interval_spin.setRange(1, 24)
-        self._scheduler_interval_spin.setValue(self._service.settings.schedule_interval_hours)
-        self._scheduler_max_pages_spin.setRange(1, 25)
-        self._scheduler_max_pages_spin.setValue(self._default_max_pages)
-        self._scheduler_start_time_input.setPlaceholderText("Optional HH:MM (24h)")
-
-        form = QFormLayout()
-        form.addRow("Task Name", self._scheduler_task_name_input)
-        form.addRow("Interval Hours", self._scheduler_interval_spin)
-        form.addRow("Max Pages", self._scheduler_max_pages_spin)
-        form.addRow("Start Time", self._scheduler_start_time_input)
-        form.addRow("Current Status", self._scheduler_status_value)
-        layout.addLayout(form)
-
         controls = QHBoxLayout()
-        self._scheduler_check_button.clicked.connect(self._scheduler_check_status_clicked)
-        self._scheduler_install_button.clicked.connect(self._scheduler_install_clicked)
-        self._scheduler_run_now_button.clicked.connect(self._scheduler_run_now_clicked)
-        self._scheduler_uninstall_button.clicked.connect(self._scheduler_uninstall_clicked)
-
-        controls.addWidget(self._scheduler_check_button)
-        controls.addWidget(self._scheduler_install_button)
-        controls.addWidget(self._scheduler_run_now_button)
-        controls.addWidget(self._scheduler_uninstall_button)
+        controls.addWidget(refresh_button)
         controls.addStretch(1)
-
         layout.addLayout(controls)
-        layout.addStretch(1)
+        layout.addWidget(self._notifications_table)
         return widget
 
     def _build_settings_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
 
         self._settings_notification_threshold_input.setPlaceholderText("0.80")
         self._settings_user_years_input.setPlaceholderText("1")
-        self._settings_schedule_interval_input.setPlaceholderText("2")
+        self._settings_ingest_host_input.setPlaceholderText("127.0.0.1")
+        self._settings_ingest_port_input.setPlaceholderText("3838")
+        self._settings_ingest_payload_input.setPlaceholderText("1000000")
         self._settings_critical_skills_input.setPlaceholderText("python,fastapi,sql,aws")
         self._settings_reject_terms_input.setPlaceholderText("senior,staff,principal,architect")
+
+        # Weight sliders (Phase 2)
+        self._relevance_slider = QSlider(Qt.Orientation.Horizontal)
+        self._relevance_slider.setRange(0, 100)
+        self._relevance_slider.setValue(50)
+        self._relevance_label = QLabel("Relevance: 0.50")
+        
+        self._attainability_slider = QSlider(Qt.Orientation.Horizontal)
+        self._attainability_slider.setRange(0, 100)
+        self._attainability_slider.setValue(30)
+        self._attainability_label = QLabel("Attainability: 0.30")
+        
+        self._recency_slider = QSlider(Qt.Orientation.Horizontal)
+        self._recency_slider.setRange(0, 100)
+        self._recency_slider.setValue(20)
+        self._recency_label = QLabel("Recency: 0.20")
+        
+        # Connect sliders to update labels
+        self._relevance_slider.valueChanged.connect(
+            lambda v: self._relevance_label.setText(f"Relevance: {v/100:.2f}")
+        )
+        self._attainability_slider.valueChanged.connect(
+            lambda v: self._attainability_label.setText(f"Attainability: {v/100:.2f}")
+        )
+        self._recency_slider.valueChanged.connect(
+            lambda v: self._recency_label.setText(f"Recency: {v/100:.2f}")
+        )
 
         form = QFormLayout()
         form.addRow("Env File", self._settings_env_path_value)
         form.addRow("Notification Threshold", self._settings_notification_threshold_input)
         form.addRow("User Years Experience", self._settings_user_years_input)
-        form.addRow("Schedule Interval Hours", self._settings_schedule_interval_input)
+        form.addRow("Ingest Host", self._settings_ingest_host_input)
+        form.addRow("Ingest Port", self._settings_ingest_port_input)
+        form.addRow("Ingest Max Payload Bytes", self._settings_ingest_payload_input)
         form.addRow("Critical Skills (CSV)", self._settings_critical_skills_input)
         form.addRow("Reject Terms (CSV)", self._settings_reject_terms_input)
         form.addRow("Flags", self._settings_auto_stage_checkbox)
-        form.addRow("", self._settings_require_auth_checkbox)
-        form.addRow("", self._settings_wellfound_enabled_checkbox)
-        form.addRow("", self._settings_builtin_enabled_checkbox)
         form.addRow("Last Save Status", self._settings_status_value)
-        layout.addLayout(form)
+        form_card = QFrame()
+        form_card.setProperty("role", "card")
+        form_layout = QVBoxLayout(form_card)
+        form_layout.setContentsMargins(12, 10, 12, 10)
+        form_layout.addLayout(form)
+        layout.addWidget(form_card)
+        
+        # Scoring Weights Section
+        weights_label = QLabel("Scoring Weights (Phase 2):")
+        weights_label.setObjectName("cardTitle")
+        weights_card = QFrame()
+        weights_card.setProperty("role", "card")
+        weights_layout = QVBoxLayout(weights_card)
+        weights_layout.setContentsMargins(12, 10, 12, 10)
+        weights_layout.addWidget(weights_label)
+        weights_layout.addWidget(self._relevance_label)
+        weights_layout.addWidget(self._relevance_slider)
+        weights_layout.addWidget(self._attainability_label)
+        weights_layout.addWidget(self._attainability_slider)
+        weights_layout.addWidget(self._recency_label)
+        weights_layout.addWidget(self._recency_slider)
+        layout.addWidget(weights_card)
 
         controls = QHBoxLayout()
         self._settings_reload_button.clicked.connect(self._reload_settings_clicked)
         self._settings_save_button.clicked.connect(self._save_settings_clicked)
+        self._settings_save_button.setObjectName("primaryButton")
         controls.addWidget(self._settings_reload_button)
         controls.addWidget(self._settings_save_button)
         controls.addStretch(1)
@@ -371,9 +699,160 @@ class JobPipeMainWindow(QMainWindow):
         layout.addStretch(1)
         return widget
 
+    def _build_cv_editor_tab(self) -> QWidget:
+        """Master CV editor with live preview (Phase 1 improvement)."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
+
+        # CV path display
+        self._cv_path_label = QLabel(f"CV Path: {self._service.settings.master_cv_path}")
+        layout.addWidget(self._cv_path_label)
+
+        # Editor and preview split
+        split_view = QSplitter(Qt.Orientation.Horizontal)
+
+        # Editor
+        editor_panel = QFrame()
+        editor_panel.setProperty("role", "card")
+        editor_layout = QVBoxLayout(editor_panel)
+        editor_layout.setContentsMargins(12, 10, 12, 10)
+        editor_label = QLabel("Editor")
+        editor_label.setObjectName("cardTitle")
+        self._cv_editor = QPlainTextEdit()
+        self._cv_editor.setPlainText(
+            self._service.settings.master_cv_path.read_text(encoding="utf-8")
+            if self._service.settings.master_cv_path.exists()
+            else ""
+        )
+        self._cv_editor.setPlaceholderText("Edit your Master CV here...")
+        editor_layout.addWidget(editor_label)
+        editor_layout.addWidget(self._cv_editor)
+
+        # Preview (read-only)
+        preview_panel = QFrame()
+        preview_panel.setProperty("role", "card")
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(12, 10, 12, 10)
+        preview_label = QLabel("Preview")
+        preview_label.setObjectName("cardTitle")
+        self._cv_preview = QPlainTextEdit()
+        self._cv_preview.setReadOnly(True)
+        self._cv_preview.setPlaceholderText("Preview will appear here...")
+        preview_layout.addWidget(preview_label)
+        preview_layout.addWidget(self._cv_preview)
+
+        split_view.addWidget(editor_panel)
+        split_view.addWidget(preview_panel)
+        split_view.setStretchFactor(0, 1)
+        split_view.setStretchFactor(1, 1)
+
+        layout.addWidget(split_view)
+
+        # Controls
+        controls = QHBoxLayout()
+        self._cv_save_button = QPushButton("Save CV")
+        self._cv_save_button.clicked.connect(self._save_cv_clicked)
+        self._cv_save_button.setObjectName("primaryButton")
+        self._cv_reload_button = QPushButton("Reload from File")
+        self._cv_reload_button.clicked.connect(self._reload_cv_clicked)
+        self._cv_watch_checkbox = QCheckBox("Watch for changes")
+        self._cv_watch_checkbox.setChecked(True)
+        self._cv_watch_checkbox.stateChanged.connect(self._toggle_cv_watcher)
+        
+        # File watcher for CV changes
+        self._cv_watcher = QFileSystemWatcher()
+        self._cv_watcher.fileChanged.connect(self._on_cv_file_changed)
+        self._watcher_enabled = True
+        if self._service.settings.master_cv_path.exists():
+            self._cv_watcher.addPath(str(self._service.settings.master_cv_path))
+        controls.addWidget(self._cv_save_button)
+        controls.addWidget(self._cv_reload_button)
+        controls.addWidget(self._cv_watch_checkbox)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        self._cv_status_label = QLabel("Ready")
+        self._cv_status_label.setProperty("role", "statusBadge")
+        layout.addWidget(self._cv_status_label)
+
+        return widget
+
+    def _save_cv_clicked(self) -> None:
+        """Save CV editor content to file."""
+        try:
+            cv_path = self._service.settings.master_cv_path
+            # Temporarily disable watcher to avoid trigger on save
+            if self._watcher_enabled:
+                self._cv_watcher.removePath(str(cv_path))
+            cv_path.write_text(self._cv_editor.toPlainText(), encoding="utf-8")
+            self._cv_status_label.setText(f"Saved at {datetime.now().strftime('%H:%M:%S')}")
+            self._append_log(f"Master CV saved to {cv_path}")
+            if self._watcher_enabled:
+                self._cv_watcher.addPath(str(cv_path))
+        except Exception as exc:
+            self._cv_status_label.setText(f"Error: {exc}")
+            QMessageBox.warning(self, "Save CV", str(exc))
+
+    def _toggle_cv_watcher(self, state: int) -> None:
+        """Toggle file watcher on/off."""
+        self._watcher_enabled = (state == Qt.CheckState.Checked.value)
+        cv_path = str(self._service.settings.master_cv_path)
+        if self._watcher_enabled:
+            if self._service.settings.master_cv_path.exists():
+                self._cv_watcher.addPath(cv_path)
+            self._append_log("CV file watcher enabled")
+        else:
+            self._cv_watcher.removePath(cv_path)
+            self._append_log("CV file watcher disabled")
+
+    def _on_cv_file_changed(self, path: str) -> None:
+        """Handle CV file change - reload editor and trigger re-scoring."""
+        self._append_log(f"CV file changed: {path}")
+        # Reload editor content
+        try:
+            cv_path = Path(path)
+            if cv_path.exists():
+                self._cv_editor.setPlainText(cv_path.read_text(encoding="utf-8"))
+                self._cv_status_label.setText("Reloaded from file change")
+        except Exception as exc:
+            self._append_log(f"Error reloading CV: {exc}")
+        
+        # Trigger re-scoring in background
+        self._rescore_jobs_async()
+    
+    def _rescore_jobs_async(self) -> None:
+        """Re-score all jobs with current CV in background thread."""
+        def do_rescore():
+            return self._service.rescore_all_jobs()
+        
+        worker = BackgroundActionWorker(do_rescore)
+        worker.signals.succeeded.connect(lambda count: self._on_rescore_complete(count))
+        worker.signals.failed.connect(lambda err: self._append_log(f"Re-scoring failed: {err}"))
+        self._thread_pool.start(worker)
+    
+    def _on_rescore_complete(self, count: int) -> None:
+        """Handle re-scoring completion."""
+        self._append_log(f"Re-scored {count} jobs")
+        self._cv_status_label.setText(f"Re-scored {count} jobs")
+        self.refresh_views()
+
+    def _reload_cv_clicked(self) -> None:
+        """Reload CV from file."""
+        try:
+            cv_path = self._service.settings.master_cv_path
+            if cv_path.exists():
+                self._cv_editor.setPlainText(cv_path.read_text(encoding="utf-8"))
+                self._cv_status_label.setText("Reloaded")
+            else:
+                self._cv_status_label.setText("File not found")
+        except Exception as exc:
+            self._cv_status_label.setText(f"Error: {exc}")
+
     def _build_resume_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
 
         self._resume_job_id_input.setPlaceholderText("Optional explicit job id")
         self._resume_min_score_input.setPlaceholderText("Defaults to notification threshold")
@@ -386,24 +865,37 @@ class JobPipeMainWindow(QMainWindow):
         form.addRow("Staged Markdown Path", self._resume_output_path_value)
         form.addRow("TeX Path", self._resume_tex_path_input)
         form.addRow("Status", self._resume_status_value)
-        layout.addLayout(form)
+        form_card = QFrame()
+        form_card.setProperty("role", "card")
+        form_layout = QVBoxLayout(form_card)
+        form_layout.setContentsMargins(12, 10, 12, 10)
+        form_layout.addLayout(form)
+        layout.addWidget(form_card)
 
         controls = QHBoxLayout()
         self._resume_stage_button.clicked.connect(self._resume_stage_clicked)
         self._resume_compile_button.clicked.connect(self._resume_compile_clicked)
         self._resume_open_pdf_button.clicked.connect(self._resume_open_pdf_clicked)
+        self._resume_stage_button.setObjectName("primaryButton")
+        self._resume_approve_button.setObjectName("primaryButton")
         controls.addWidget(self._resume_stage_button)
         controls.addWidget(self._resume_compile_button)
+        controls.addWidget(self._resume_approve_button)  # New button
         controls.addWidget(self._resume_open_pdf_button)
         controls.addStretch(1)
         layout.addLayout(controls)
 
+        # LaTeX editor (REQ-3.3)
+        editor_label = QLabel("LaTeX Resume Editor:")
+        editor_label.setObjectName("cardTitle")
+        layout.addWidget(editor_label)
         layout.addWidget(self._resume_preview)
         return widget
 
     def _build_logs_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
 
         controls = QHBoxLayout()
         clear_button = QPushButton("Clear Log")
@@ -412,7 +904,12 @@ class JobPipeMainWindow(QMainWindow):
         controls.addStretch(1)
 
         layout.addLayout(controls)
-        layout.addWidget(self._log_output)
+        log_card = QFrame()
+        log_card.setProperty("role", "card")
+        log_layout = QVBoxLayout(log_card)
+        log_layout.setContentsMargins(12, 10, 12, 10)
+        log_layout.addWidget(self._log_output)
+        layout.addWidget(log_card)
         return widget
 
     def _create_table(self, headers: list[str]) -> QTableWidget:
@@ -421,17 +918,34 @@ class JobPipeMainWindow(QMainWindow):
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setAlternatingRowColors(True)
         table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(28)
         table.horizontalHeader().setStretchLastSection(True)
         table.setSortingEnabled(False)
         return table
+
+    def _start_ingest_server(self) -> None:
+        try:
+            self._ingest_server = self._service.create_ingest_server()
+            self._ingest_server.start()
+            self._ingest_status_value.setText("Running")
+            self._ingest_endpoint_value.setText(self._ingest_server.endpoint())
+            self._append_log("Ingest server started")
+        except Exception as exc:
+            self._ingest_status_value.setText("Failed")
+            self._ingest_endpoint_value.setText(self._service.ingest_endpoint())
+            self._append_log(f"Ingest server failed to start: {exc}")
+            QMessageBox.warning(self, "Ingest Server", str(exc))
 
     def refresh_views(self) -> None:
         try:
             snapshot = self._service.dashboard_snapshot()
             jobs = self._service.list_top_jobs(limit=200)
+            self._populate_jobs(jobs)
             runs = self._service.list_recent_runs(limit=200)
             notifications = self._service.list_recent_notifications(limit=200)
+            job_count, company_count = self._service.get_jobs_and_companies_count()
         except Exception as exc:
             self._append_log(f"Refresh failed: {exc}")
             QMessageBox.critical(self, "Refresh Failed", str(exc))
@@ -441,22 +955,10 @@ class JobPipeMainWindow(QMainWindow):
         self._populate_jobs(jobs)
         self._populate_runs(runs)
         self._populate_notifications(notifications)
-        self._refresh_scheduler_status(silent=True)
+        self._jobs_count_label.setText(f"Jobs: {job_count} | Companies: {company_count}")
 
         self.statusBar().showMessage("Data refreshed", 3000)
         self._append_log("UI data refreshed")
-
-    def _refresh_scheduler_status(self, silent: bool) -> None:
-        try:
-            result = self._service.scheduler_status(task_name=self._scheduler_task_name())
-        except Exception as exc:
-            self._scheduler_status_value.setText("Unavailable")
-            self._append_log(f"Scheduler status check failed: {exc}")
-            if not silent:
-                QMessageBox.warning(self, "Scheduler Status", str(exc))
-            return
-
-        self._scheduler_status_value.setText("Installed" if result.exists else "Missing")
 
     def _populate_dashboard(self, snapshot: DashboardSnapshot) -> None:
         self._db_path_value.setText(str(self._service.settings.db_path))
@@ -468,6 +970,14 @@ class JobPipeMainWindow(QMainWindow):
                 f"| above-threshold={snapshot.above_threshold_jobs}"
             )
         )
+
+        if self._ingest_server is None:
+            self._ingest_status_value.setText("Stopped")
+            self._ingest_endpoint_value.setText(self._service.ingest_endpoint())
+        else:
+            status = "Running" if self._ingest_server.is_running() else "Stopped"
+            self._ingest_status_value.setText(status)
+            self._ingest_endpoint_value.setText(self._ingest_server.endpoint())
 
         if snapshot.last_run is None:
             self._last_run_status_value.setText("No runs yet")
@@ -482,57 +992,42 @@ class JobPipeMainWindow(QMainWindow):
         self._last_run_finished_value.setText(_format_datetime(last_run.finished_at))
         self._last_run_summary_value.setText(
             (
-                f"scraped={last_run.scraped}, inserted={last_run.inserted}, "
+                f"ingested={last_run.scraped}, inserted={last_run.inserted}, "
                 f"updated={last_run.updated}, scored={last_run.scored}, "
                 f"above={last_run.above_threshold}, notified={last_run.notified}"
             )
         )
-
-        self._update_auth_status(self._auth_hiringcafe_value, snapshot.auth_states.get("HiringCafe"))
-        self._update_auth_status(self._auth_wellfound_value, snapshot.auth_states.get("Wellfound"))
-        self._update_auth_status(self._auth_builtin_value, snapshot.auth_states.get("BuiltIn"))
-
-    def _update_auth_status(self, label: QLabel, status: StorageStateStatus | None) -> None:
-        if status is None:
-            label.setText("Unknown")
-            label.setStyleSheet("")
-            return
-
-        if not status.exists:
-            label.setText("Missing (Storage state file not found)")
-            label.setStyleSheet("color: orange;")
-            return
-
-        if not status.valid_json:
-            label.setText("Error (Invalid JSON)")
-            label.setStyleSheet("color: red;")
-            return
-
-        if status.usable:
-            label.setText(f"OK ({status.cookie_count} cookies, {status.unexpired_cookie_count} unexpired)")
-            label.setStyleSheet("color: darkgreen;")
-        else:
-            errors = ", ".join(status.errors) if status.errors else "Unusable"
-            label.setText(f"Expired/Invalid ({errors})")
-            label.setStyleSheet("color: red;")
 
     def _populate_jobs(self, jobs: list) -> None:
         self._jobs_table.setSortingEnabled(False)
         self._jobs_table.setRowCount(len(jobs))
 
         for row, job in enumerate(jobs):
+            # Build posted display: prefer posted_ago (e.g., "2 hours ago") with date_posted as tooltip
+            posted_display = job.posted_ago or _format_datetime(job.date_posted)
+            
             values = [
-                _format_score(job.match_score),
+                _format_score(job.match_score),  # Total
+                _format_score(job.score_relevance),  # Relevance
+                _format_score(job.score_attainability),  # Attainability
+                _format_score(job.score_recency),  # Recency
                 job.title,
                 job.company,
                 job.platform,
                 job.status,
-                _format_datetime(job.date_posted),
+                posted_display,
                 job.url,
             ]
             for column, text in enumerate(values):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                # Add tooltip with full date if using posted_ago
+                if column == 8 and job.posted_ago:  # Posted column
+                    item.setToolTip(_format_datetime(job.date_posted))
+                # Add tooltip for score columns showing "Why this score?"
+                if column in [0, 1, 2, 3] and text != "n/a":
+                    score_type = ["Total", "Relevance", "Attainability", "Recency"][column]
+                    item.setToolTip(f"{score_type}: {text}\nClick for details")
                 self._jobs_table.setItem(row, column, item)
 
         self._jobs_table.resizeColumnsToContents()
@@ -593,7 +1088,7 @@ class JobPipeMainWindow(QMainWindow):
             return
 
         row = selected[0].row()
-        url_item = self._jobs_table.item(row, 6)
+        url_item = self._jobs_table.item(row, 9)
         if url_item is None:
             QMessageBox.warning(self, "Missing URL", "Selected row has no URL.")
             return
@@ -610,161 +1105,92 @@ class JobPipeMainWindow(QMainWindow):
 
         self._append_log(f"Opened URL: {url}")
 
-    def _run_once_clicked(self) -> None:
-        if self._run_in_progress:
+    def _on_job_selection_changed(self) -> None:
+        selected = self._jobs_table.selectionModel().selectedRows()
+        if not selected:
+            self._job_details_text.clear()
             return
 
-        max_pages = self._max_pages_spin.value()
-        self._run_in_progress = True
-        self._run_once_button.setEnabled(False)
-        self.statusBar().showMessage("Running pipeline...")
-        self._append_log(f"Starting run-once with max-pages={max_pages}")
+        row = selected[0].row()
+        details = []
+        
+        # Get basic info from table
+        title_item = self._jobs_table.item(row, 4)  # Title column
+        company_item = self._jobs_table.item(row, 5)  # Company column
+        url_item = self._jobs_table.item(row, 9)  # URL column
+        
+        if title_item:
+            details.append(f"Title: {title_item.text()}")
+        if company_item:
+            details.append(f"Company: {company_item.text()}")
+        if url_item:
+            details.append(f"URL: {url_item.text()}")
+        
+        # Get the full job record to show all details
+        url = url_item.text().strip() if url_item else ""
+        if url:
+            snapshot = self._service.snapshot()
+            matching_jobs = [j for j in snapshot.jobs if j.url == url]
+            if matching_jobs:
+                job = matching_jobs[0]
+                if job.summary:
+                    details.append(f"\nSummary: {job.summary[:200]}..." if len(job.summary) > 200 else f"\nSummary: {job.summary}")
+                if job.requirements:
+                    details.append(f"\nRequirements: {job.requirements[:200]}..." if len(job.requirements) > 200 else f"\nRequirements: {job.requirements}")
+                if job.location:
+                    details.append(f"Location: {job.location}")
+                if job.county:
+                    details.append(f"County: {job.county}")
+                if job.workplace_type:
+                    details.append(f"Workplace: {job.workplace_type}")
+                if job.employment_type:
+                    details.append(f"Employment: {job.employment_type}")
+                if job.department:
+                    details.append(f"Department: {job.department}")
+                if job.team:
+                    details.append(f"Team: {job.team}")
+                if job.compensation:
+                    details.append(f"Compensation: {job.compensation}")
+                if job.posted_at:
+                    details.append(f"Posted At: {job.posted_at}")
+                if job.posted_ago:
+                    details.append(f"Posted: {job.posted_ago}")
+                if job.views is not None:
+                    details.append(f"Views: {job.views}")
+                if job.saves is not None:
+                    details.append(f"Saves: {job.saves}")
+                if job.applications is not None:
+                    details.append(f"Applications: {job.applications}")
+        
+        self._job_details_text.setPlainText("\n".join(details))
 
-        worker = RunOnceWorker(service=self._service, max_pages=max_pages)
-        worker.signals.succeeded.connect(self._run_once_succeeded)
-        worker.signals.failed.connect(self._run_once_failed)
-        worker.signals.completed.connect(self._run_once_completed)
-        self._current_worker = worker
-        self._thread_pool.start(worker)
-
-    def _run_once_succeeded(self, summary: object) -> None:
-        self._append_log(
-            (
-                "Run completed successfully: "
-                f"scraped={summary.scraped}, inserted={summary.inserted}, "
-                f"updated={summary.updated}, scored={summary.scored}, "
-                f"above={summary.above_threshold}, notified={summary.notified}"
-            )
-        )
-        self.statusBar().showMessage("Run completed", 5000)
-
-    def _run_once_failed(self, message: str) -> None:
-        self._append_log(f"Run failed: {message}")
-        QMessageBox.critical(self, "Run Failed", message)
-        self.statusBar().showMessage("Run failed", 5000)
-
-    def _run_once_completed(self) -> None:
-        self._run_in_progress = False
-        self._run_once_button.setEnabled(True)
-        self._current_worker = None
-        self.refresh_views()
-
-    def _scheduler_task_name(self) -> str:
-        candidate = self._scheduler_task_name_input.text().strip()
-        return candidate or "JobPipeAggregator"
-
-    def _set_scheduler_controls_enabled(self, enabled: bool) -> None:
-        self._scheduler_task_name_input.setEnabled(enabled)
-        self._scheduler_interval_spin.setEnabled(enabled)
-        self._scheduler_max_pages_spin.setEnabled(enabled)
-        self._scheduler_start_time_input.setEnabled(enabled)
-        self._scheduler_check_button.setEnabled(enabled)
-        self._scheduler_install_button.setEnabled(enabled)
-        self._scheduler_run_now_button.setEnabled(enabled)
-        self._scheduler_uninstall_button.setEnabled(enabled)
-
-    def _start_scheduler_action(
-        self,
-        action_name: str,
-        fn: Callable[[], object],
-        success_handler: Callable[[object], None],
-    ) -> None:
-        if self._scheduler_busy:
-            return
-
-        self._scheduler_busy = True
-        self._set_scheduler_controls_enabled(False)
-        self.statusBar().showMessage(f"Scheduler action running: {action_name}")
-        self._append_log(f"Scheduler action started: {action_name}")
-
-        worker = BackgroundActionWorker(fn=fn)
-        worker.signals.succeeded.connect(success_handler)
-        worker.signals.failed.connect(self._scheduler_action_failed)
-        worker.signals.completed.connect(self._scheduler_action_completed)
-        self._current_scheduler_worker = worker
-        self._thread_pool.start(worker)
-
-    def _scheduler_check_status_clicked(self) -> None:
-        self._start_scheduler_action(
-            action_name="Check Status",
-            fn=lambda: self._service.scheduler_status(task_name=self._scheduler_task_name()),
-            success_handler=self._scheduler_status_succeeded,
+    def _clear_jobs(self) -> None:
+        """Clear all jobs from the database after user confirmation."""
+        reply = QMessageBox.question(
+            self,
+            "Confirm Clear Jobs",
+            "Are you sure you want to delete ALL jobs from the database?\n\nThis action cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
 
-    def _scheduler_install_clicked(self) -> None:
-        task_name = self._scheduler_task_name()
-        interval_hours = self._scheduler_interval_spin.value()
-        max_pages = self._scheduler_max_pages_spin.value()
-        start_time = self._scheduler_start_time_input.text().strip() or None
-
-        self._start_scheduler_action(
-            action_name="Install / Update",
-            fn=lambda: self._service.install_or_update_scheduler(
-                task_name=task_name,
-                interval_hours=interval_hours,
-                max_pages=max_pages,
-                start_time=start_time,
-            ),
-            success_handler=self._scheduler_install_succeeded,
-        )
-
-    def _scheduler_run_now_clicked(self) -> None:
-        self._start_scheduler_action(
-            action_name="Run Now",
-            fn=lambda: self._service.run_scheduler_now(task_name=self._scheduler_task_name()),
-            success_handler=self._scheduler_run_now_succeeded,
-        )
-
-    def _scheduler_uninstall_clicked(self) -> None:
-        self._start_scheduler_action(
-            action_name="Uninstall",
-            fn=lambda: self._service.uninstall_scheduler(task_name=self._scheduler_task_name()),
-            success_handler=self._scheduler_uninstall_succeeded,
-        )
-
-    def _scheduler_status_succeeded(self, result: object) -> None:
-        exists = bool(getattr(result, "exists", False))
-        self._scheduler_status_value.setText("Installed" if exists else "Missing")
-        self._append_log(f"Scheduler status checked | exists={exists}")
-        stdout = getattr(result, "stdout", "")
-        if stdout:
-            self._append_log(stdout)
-
-    def _scheduler_install_succeeded(self, result: object) -> None:
-        task_name = getattr(result, "task_name", self._scheduler_task_name())
-        interval = getattr(result, "interval_hours", self._scheduler_interval_spin.value())
-        self._scheduler_status_value.setText("Installed")
-        self._append_log(f"Scheduler installed/updated | task={task_name} interval_hours={interval}")
-        run_command = getattr(result, "run_command", "")
-        if run_command:
-            self._append_log(f"Task run command: {run_command}")
-
-    def _scheduler_run_now_succeeded(self, result: object) -> None:
-        task_name = getattr(result, "task_name", self._scheduler_task_name())
-        self._append_log(f"Scheduler triggered immediately | task={task_name}")
-        stdout = getattr(result, "stdout", "")
-        if stdout:
-            self._append_log(stdout)
-
-    def _scheduler_uninstall_succeeded(self, result: object) -> None:
-        task_name = getattr(result, "task_name", self._scheduler_task_name())
-        deleted = bool(getattr(result, "deleted", False))
-        self._scheduler_status_value.setText("Missing")
-        action = "deleted" if deleted else "already absent"
-        self._append_log(f"Scheduler uninstall complete | task={task_name} state={action}")
-        stdout = getattr(result, "stdout", "")
-        if stdout:
-            self._append_log(stdout)
-
-    def _scheduler_action_failed(self, message: str) -> None:
-        self._append_log(f"Scheduler action failed: {message}")
-        QMessageBox.critical(self, "Scheduler Action Failed", message)
-
-    def _scheduler_action_completed(self) -> None:
-        self._scheduler_busy = False
-        self._set_scheduler_controls_enabled(True)
-        self._current_scheduler_worker = None
-        self.statusBar().showMessage("Scheduler action complete", 5000)
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                deleted_count = self._service.clear_jobs()
+                self.refresh_views()
+                QMessageBox.information(
+                    self,
+                    "Jobs Cleared",
+                    f"Successfully deleted {deleted_count} jobs from the database.",
+                )
+                self._append_log(f"Cleared {deleted_count} jobs from database")
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Clear Failed",
+                    f"Failed to clear jobs: {exc}",
+                )
+                self._append_log(f"Failed to clear jobs: {exc}")
 
     def _set_resume_controls_enabled(self, enabled: bool) -> None:
         self._resume_job_id_input.setEnabled(enabled)
@@ -819,6 +1245,52 @@ class JobPipeMainWindow(QMainWindow):
             success_handler=self._resume_stage_succeeded,
         )
 
+    def _resume_approve_clicked(self) -> None:
+        """Handle Approve & Compile button click (REQ-3.4).
+
+        This reads the current LaTeX content from the editor, saves it to the
+        TeX path, and compiles it with the approved flag set to True.
+        """
+        # Get LaTeX content from editor
+        latex_content = self._resume_preview.get_latex_content()
+        if not latex_content.strip():
+            QMessageBox.warning(
+                self,
+                "Empty Resume",
+                "The LaTeX editor is empty. Nothing to approve and compile.",
+            )
+            return
+
+        # Get output path
+        tex_path_text = self._resume_tex_path_input.text().strip()
+        if not tex_path_text:
+            tex_path_text = str(self._service.default_resume_tex_path())
+        from pathlib import Path
+
+        tex_path = Path(tex_path_text)
+        if not tex_path_text.lower().endswith(".tex"):
+            tex_path = tex_path.with_suffix(".tex")
+
+        # Save the editor content to file
+        try:
+            tex_path.parent.mkdir(parents=True, exist_ok=True)
+            tex_path.write_text(latex_content, encoding="utf-8")
+            self._append_log(f"Saved approved LaTeX to: {tex_path}")
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Save Failed",
+                f"Could not save LaTeX file:\n{exc}",
+            )
+            return
+
+        # Now compile with approved=True
+        self._start_resume_action(
+            action_name="Approve & Compile",
+            fn=lambda: self._service.approve_and_compile_resume(tex_path=tex_path),
+            success_handler=self._resume_compile_succeeded,
+        )
+
     def _resume_compile_clicked(self) -> None:
         tex_path_text = self._resume_tex_path_input.text().strip()
         tex_path = Path(tex_path_text) if tex_path_text else None
@@ -852,12 +1324,21 @@ class JobPipeMainWindow(QMainWindow):
 
     def _resume_stage_succeeded(self, result: object) -> None:
         output_path = Path(str(getattr(result, "output_path")))
-        self._resume_output_path_value.setText(str(output_path))
 
+        # Load the staged content into the LaTeX editor
         preview = ""
         if output_path.exists():
             preview = output_path.read_text(encoding="utf-8")
-        self._resume_preview.setPlainText(preview)
+
+            # If it's a .tex file, load into editor
+            if output_path.suffix.lower() == ".tex":
+                self._resume_preview.load_file(output_path)
+                self._resume_tex_path_input.setText(str(output_path))
+            else:
+                # It's markdown, show in editor for reference
+                self._resume_preview.setPlainText(preview)
+
+        self._resume_output_path_value.setText(str(output_path))
 
         score = getattr(result, "score", None)
         score_text = "n/a" if score is None else f"{score:.3f}"
@@ -893,46 +1374,48 @@ class JobPipeMainWindow(QMainWindow):
 
     def _collect_settings_form_values(self) -> dict[str, str]:
         return {
-            "JOBPIPE_NOTIFICATION_THRESHOLD": self._settings_notification_threshold_input.text().strip(),
-            "JOBPIPE_USER_YEARS_EXPERIENCE": self._settings_user_years_input.text().strip(),
-            "JOBPIPE_SCHEDULE_INTERVAL_HOURS": self._settings_schedule_interval_input.text().strip(),
+            "JOBPIPE_NOTIFICATION_THRESHOLD": (
+                self._settings_notification_threshold_input.text().strip()
+            ),
+            "JOBPIPE_USER_YEARS_EXPERIENCE": (
+                self._settings_user_years_input.text().strip()
+            ),
+            "JOBPIPE_INGEST_HOST": self._settings_ingest_host_input.text().strip(),
+            "JOBPIPE_INGEST_PORT": self._settings_ingest_port_input.text().strip(),
+            "JOBPIPE_INGEST_MAX_PAYLOAD_BYTES": (
+                self._settings_ingest_payload_input.text().strip()
+            ),
             "JOBPIPE_AUTO_STAGE_JOB_DESCRIPTION": str(
                 self._settings_auto_stage_checkbox.isChecked()
             ).lower(),
-            "JOBPIPE_REQUIRE_USABLE_AUTH_STATE": str(
-                self._settings_require_auth_checkbox.isChecked()
-            ).lower(),
-            "JOBPIPE_WELLFOUND_ENABLED": str(
-                self._settings_wellfound_enabled_checkbox.isChecked()
-            ).lower(),
-            "JOBPIPE_BUILTIN_ENABLED": str(self._settings_builtin_enabled_checkbox.isChecked()).lower(),
             "JOBPIPE_CRITICAL_SKILLS": self._settings_critical_skills_input.text().strip(),
             "JOBPIPE_REJECT_TERMS": self._settings_reject_terms_input.text().strip(),
         }
 
     def _set_settings_form_values(self, values: dict[str, str]) -> None:
-        self._settings_env_path_value.setText(str(self._service.editable_env_file_path()))
+        self._settings_env_path_value.setText(
+            str(self._service.editable_env_file_path())
+        )
         self._settings_notification_threshold_input.setText(
             values.get("JOBPIPE_NOTIFICATION_THRESHOLD", "")
         )
-        self._settings_user_years_input.setText(values.get("JOBPIPE_USER_YEARS_EXPERIENCE", ""))
-        self._settings_schedule_interval_input.setText(
-            values.get("JOBPIPE_SCHEDULE_INTERVAL_HOURS", "")
+        self._settings_user_years_input.setText(
+            values.get("JOBPIPE_USER_YEARS_EXPERIENCE", "")
         )
-        self._settings_critical_skills_input.setText(values.get("JOBPIPE_CRITICAL_SKILLS", ""))
-        self._settings_reject_terms_input.setText(values.get("JOBPIPE_REJECT_TERMS", ""))
+        self._settings_ingest_host_input.setText(values.get("JOBPIPE_INGEST_HOST", ""))
+        self._settings_ingest_port_input.setText(values.get("JOBPIPE_INGEST_PORT", ""))
+        self._settings_ingest_payload_input.setText(
+            values.get("JOBPIPE_INGEST_MAX_PAYLOAD_BYTES", "")
+        )
+        self._settings_critical_skills_input.setText(
+            values.get("JOBPIPE_CRITICAL_SKILLS", "")
+        )
+        self._settings_reject_terms_input.setText(
+            values.get("JOBPIPE_REJECT_TERMS", "")
+        )
 
         self._settings_auto_stage_checkbox.setChecked(
             _is_truthy_env_value(values.get("JOBPIPE_AUTO_STAGE_JOB_DESCRIPTION", "false"))
-        )
-        self._settings_require_auth_checkbox.setChecked(
-            _is_truthy_env_value(values.get("JOBPIPE_REQUIRE_USABLE_AUTH_STATE", "false"))
-        )
-        self._settings_wellfound_enabled_checkbox.setChecked(
-            _is_truthy_env_value(values.get("JOBPIPE_WELLFOUND_ENABLED", "false"))
-        )
-        self._settings_builtin_enabled_checkbox.setChecked(
-            _is_truthy_env_value(values.get("JOBPIPE_BUILTIN_ENABLED", "false"))
         )
 
     def _load_settings_form_values(self, silent: bool) -> None:
@@ -947,13 +1430,6 @@ class JobPipeMainWindow(QMainWindow):
 
         self._set_settings_form_values(values)
         self._settings_status_value.setText("Loaded")
-
-        try:
-            schedule_interval = int(values.get("JOBPIPE_SCHEDULE_INTERVAL_HOURS", ""))
-            if 1 <= schedule_interval <= 24:
-                self._scheduler_interval_spin.setValue(schedule_interval)
-        except ValueError:
-            pass
 
         self._append_log("Settings form loaded from .env")
         if not silent:
@@ -979,12 +1455,302 @@ class JobPipeMainWindow(QMainWindow):
         self.statusBar().showMessage("Settings saved", 4000)
         self.refresh_views()
 
+    def _build_resume_variants_tab(self) -> QWidget:
+        """Build the Resume Variants tab with filtering and ATS optimization."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
+
+        # Filter controls
+        filter_layout = QHBoxLayout()
+
+        # Company filter
+        filter_layout.addWidget(QLabel("Company:"))
+        self._variant_company_filter = QLineEdit()
+        self._variant_company_filter.setPlaceholderText("Filter by company...")
+        self._variant_company_filter.textChanged.connect(self._refresh_variants_table)
+        filter_layout.addWidget(self._variant_company_filter)
+
+        # Job type filter
+        filter_layout.addWidget(QLabel("Job Type:"))
+        self._variant_job_type_filter = QLineEdit()
+        self._variant_job_type_filter.setPlaceholderText("Filter by job type...")
+        self._variant_job_type_filter.textChanged.connect(self._refresh_variants_table)
+        filter_layout.addWidget(self._variant_job_type_filter)
+
+        # Page length filter
+        filter_layout.addWidget(QLabel("Pages:"))
+        self._variant_page_length_filter = QLineEdit()
+        self._variant_page_length_filter.setPlaceholderText("1 or 2")
+        self._variant_page_length_filter.textChanged.connect(self._refresh_variants_table)
+        filter_layout.addWidget(self._variant_page_length_filter)
+
+        # ATS optimized filter
+        self._variant_ats_filter = QCheckBox("ATS Optimized Only")
+        self._variant_ats_filter.stateChanged.connect(self._refresh_variants_table)
+        filter_layout.addWidget(self._variant_ats_filter)
+
+        filter_layout.addStretch(1)
+
+        # Refresh button
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._refresh_variants_table)
+        filter_layout.addWidget(refresh_btn)
+
+        layout.addLayout(filter_layout)
+
+        # Variants table
+        self._variants_table = QTableWidget()
+        self._variants_table.setColumnCount(9)
+        self._variants_table.setHorizontalHeaderLabels([
+            "ID", "Variant Name", "Company", "Job Type", "Pages",
+            "Generation", "CV Hash", "ATS Score", "Created"
+        ])
+        self._variants_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._variants_table.setAlternatingRowColors(True)
+        self._variants_table.setSortingEnabled(True)
+        layout.addWidget(self._variants_table)
+
+        # Action buttons
+        button_layout = QHBoxLayout()
+
+        view_lineage_btn = QPushButton("View Lineage")
+        view_lineage_btn.clicked.connect(self._view_variant_lineage)
+        button_layout.addWidget(view_lineage_btn)
+
+        ats_optimize_btn = QPushButton("ATS Optimize Selected")
+        ats_optimize_btn.clicked.connect(self._ats_optimize_selected_variant)
+        button_layout.addWidget(ats_optimize_btn)
+
+        ats_optimize_all_btn = QPushButton("ATS Optimize All for Job")
+        ats_optimize_all_btn.clicked.connect(self._ats_optimize_all_for_selected_job)
+        button_layout.addWidget(ats_optimize_all_btn)
+
+        open_tex_btn = QPushButton("Open TeX")
+        open_tex_btn.clicked.connect(self._open_selected_variant_tex)
+        button_layout.addWidget(open_tex_btn)
+
+        open_pdf_btn = QPushButton("Open PDF")
+        open_pdf_btn.clicked.connect(self._open_selected_variant_pdf)
+        button_layout.addWidget(open_pdf_btn)
+
+        button_layout.addStretch(1)
+        layout.addLayout(button_layout)
+
+        # Status label
+        self._variants_status_label = QLabel("Ready")
+        self._variants_status_label.setProperty("role", "statusBadge")
+        layout.addWidget(self._variants_status_label)
+
+        return widget
+
+    def _refresh_variants_table(self) -> None:
+        """Refresh the variants table with current filters."""
+        try:
+            # Get filter values
+            company = self._variant_company_filter.text().strip() or None
+            job_type = self._variant_job_type_filter.text().strip() or None
+            page_length_str = self._variant_page_length_filter.text().strip()
+            page_length = None
+            if page_length_str in ("1", "2"):
+                page_length = int(page_length_str)
+            ats_only = self._variant_ats_filter.isChecked()
+
+            # Get variants from service
+            variants = self._service.list_resume_variants(
+                target_company=company,
+                job_type=job_type,
+                page_length=page_length,
+                ats_optimized=True if ats_only else None,
+                limit=500,
+            )
+
+            # Populate table
+            self._variants_table.setSortingEnabled(False)
+            self._variants_table.setRowCount(len(variants))
+
+            for row, variant in enumerate(variants):
+                values = [
+                    str(variant.id),
+                    variant.variant_name,
+                    variant.target_company or "N/A",
+                    variant.job_type or "N/A",
+                    str(variant.page_length),
+                    str(variant.generation_number),
+                    variant.master_cv_hash[:8] + "..." if len(variant.master_cv_hash) > 8 else variant.master_cv_hash,
+                    f"{variant.ats_score:.2f}" if variant.ats_score else "N/A",
+                    variant.created_at.strftime("%Y-%m-%d %H:%M") if variant.created_at else "N/A",
+                ]
+                for col, text in enumerate(values):
+                    item = QTableWidgetItem(text)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    self._variants_table.setItem(row, col, item)
+
+            self._variants_table.resizeColumnsToContents()
+            self._variants_table.setSortingEnabled(True)
+            self._variants_status_label.setText(f"Loaded {len(variants)} variants")
+
+        except Exception as exc:
+            self._variants_status_label.setText(f"Error: {exc}")
+            QMessageBox.warning(self, "Refresh Variants", str(exc))
+
+    def _get_selected_variant_id(self) -> int | None:
+        """Get the selected variant ID from the table."""
+        selection = self._variants_table.selectionModel().selectedRows()
+        if not selection:
+            return None
+        id_item = self._variants_table.item(selection[0].row(), 0)
+        if id_item:
+            return int(id_item.text())
+        return None
+
+    def _view_variant_lineage(self) -> None:
+        """View the generational lineage of the selected variant."""
+        variant_id = self._get_selected_variant_id()
+        if variant_id is None:
+            QMessageBox.information(self, "View Lineage", "Please select a variant first.")
+            return
+
+        try:
+            lineage = self._service.get_variant_lineage(variant_id)
+            if not lineage:
+                QMessageBox.information(self, "View Lineage", "No lineage data found.")
+                return
+
+            # Build lineage text
+            text = "Resume Variant Lineage:\n\n"
+            for i, variant in enumerate(lineage):
+                text += f"Generation {variant.generation_number}:\n"
+                text += f"  ID: {variant.id}\n"
+                text += f"  Name: {variant.variant_name}\n"
+                text += f"  Company: {variant.target_company or 'N/A'}\n"
+                text += f"  CV Hash: {variant.master_cv_hash[:16] if variant.master_cv_hash else 'N/A'}...\n"
+                text += f"  Created: {variant.created_at}\n"
+                if i < len(lineage) - 1:
+                    text += "\n"
+
+            QMessageBox.information(self, "Variant Lineage", text)
+
+        except Exception as exc:
+            QMessageBox.critical(self, "View Lineage", str(exc))
+
+    def _ats_optimize_selected_variant(self) -> None:
+        """Run ATS optimization on the selected variant."""
+        variant_id = self._get_selected_variant_id()
+        if variant_id is None:
+            QMessageBox.information(self, "ATS Optimize", "Please select a variant first.")
+            return
+
+        reply = QMessageBox.question(
+            self, "ATS Optimize",
+            "Run ATS optimization on the selected variant?\nThis will use the Gemini API.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._variants_status_label.setText("Running ATS optimization...")
+        QApplication.processEvents()
+
+        try:
+            result = self._service.ats_optimize_variant(variant_id)
+            score = result.get("ats_score", 0)
+            recs = result.get("recommendations", [])
+
+            msg = f"ATS Optimization Complete!\n\nATS Score: {score:.2f}\n\n"
+            if recs:
+                msg += "Recommendations:\n"
+                for i, rec in enumerate(recs[:5], 1):
+                    msg += f"{i}. {rec}\n"
+
+            QMessageBox.information(self, "ATS Optimization Complete", msg)
+            self._refresh_variants_table()
+
+        except Exception as exc:
+            QMessageBox.critical(self, "ATS Optimization Failed", str(exc))
+            self._variants_status_label.setText(f"Error: {exc}")
+
+    def _ats_optimize_all_for_selected_job(self) -> None:
+        """Run ATS optimization on all variants for the selected job."""
+        variant_id = self._get_selected_variant_id()
+        if variant_id is None:
+            QMessageBox.information(self, "ATS Optimize All", "Please select a variant first.")
+            return
+
+        try:
+            variant = self._service.get_variant_by_id(variant_id)
+            if not variant or not variant.job_id:
+                QMessageBox.information(self, "ATS Optimize All", "Selected variant has no associated job.")
+                return
+
+            reply = QMessageBox.question(
+                self, "ATS Optimize All",
+                f"Run ATS optimization on ALL variants for job {variant.job_id}?\n"
+                "This will use the Gemini API for each variant.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+            self._variants_status_label.setText("Running ATS optimization on all variants...")
+            QApplication.processEvents()
+
+            result = self._service.ats_optimize_all_for_role(job_id=variant.job_id)
+
+            msg = f"ATS Optimization Complete!\n\n"
+            msg += f"Total variants: {result['total']}\n"
+            msg += f"Optimized: {result['optimized']}\n"
+            msg += f"Failed: {result['failed']}\n"
+
+            QMessageBox.information(self, "ATS Optimization Complete", msg)
+            self._refresh_variants_table()
+
+        except Exception as exc:
+            QMessageBox.critical(self, "ATS Optimization Failed", str(exc))
+            self._variants_status_label.setText(f"Error: {exc}")
+
+    def _open_selected_variant_tex(self) -> None:
+        """Open the TeX file of the selected variant."""
+        variant_id = self._get_selected_variant_id()
+        if variant_id is None:
+            QMessageBox.information(self, "Open TeX", "Please select a variant first.")
+            return
+
+        try:
+            variant = self._service.get_variant_by_id(variant_id)
+            if variant and variant.tex_path:
+                tex_path = Path(variant.tex_path)
+                if tex_path.exists():
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(tex_path)))
+                else:
+                    QMessageBox.warning(self, "Open TeX", f"File not found: {tex_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Open TeX", str(exc))
+
+    def _open_selected_variant_pdf(self) -> None:
+        """Open the PDF file of the selected variant."""
+        variant_id = self._get_selected_variant_id()
+        if variant_id is None:
+            QMessageBox.information(self, "Open PDF", "Please select a variant first.")
+            return
+
+        try:
+            variant = self._service.get_variant_by_id(variant_id)
+            if variant and variant.pdf_path:
+                pdf_path = Path(variant.pdf_path)
+                if pdf_path.exists():
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(pdf_path)))
+                else:
+                    QMessageBox.warning(self, "Open PDF", f"File not found: {pdf_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Open PDF", str(exc))
+
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self._log_output.appendPlainText(f"[{timestamp}] {message}")
 
 
-def launch_gui(settings: Settings, default_max_pages: int = 1) -> int:
+def launch_gui(settings: Settings) -> int:
     app = QApplication.instance()
     owns_app = app is None
     if app is None:
@@ -992,7 +1758,6 @@ def launch_gui(settings: Settings, default_max_pages: int = 1) -> int:
 
     window = JobPipeMainWindow(
         service=JobPipeGuiService(settings),
-        default_max_pages=default_max_pages,
     )
     window.show()
 

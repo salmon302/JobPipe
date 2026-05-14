@@ -1,3 +1,8 @@
+# Purpose: Process ingested jobs, score matches, notify, and stage resumes.
+# Author: Seth Nenninger (GPT-5.2-Codex Agent)
+# Timestamp: 2026-05-12T00:00:00Z
+# Changelog: Replace scraper pipeline with ingest batch processing.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,6 +10,7 @@ from datetime import datetime, timezone
 import logging
 import os
 from pathlib import Path
+import threading
 from uuid import uuid4
 
 from jobpipe.config import Settings
@@ -12,16 +18,11 @@ from jobpipe.notifications.windows_toast import notify_job_match
 from jobpipe.resume.staging import ResumeTargetNotFoundError, stage_job_description
 from jobpipe.scoring.attainability import attainability_score, should_discard_for_senior_role
 from jobpipe.scoring.calculator import compute_total_match_score
-from jobpipe.scoring.embeddings import LocalEmbedder, relevance_score
+from jobpipe.scoring.embeddings import LocalEmbedder, relevance_scores
 from jobpipe.scoring.extractors import extract_years_required, infer_remote
-from jobpipe.scoring.prefilter import passes_prefilter
 from jobpipe.scoring.recency import recency_score
-from jobpipe.scrapers.auth_state import UnusableStorageStateError
-from jobpipe.scrapers.base import JobScraper
-from jobpipe.scrapers.builtin import BuiltInScraper, BuiltInScraperConfig
-from jobpipe.scrapers.hiringcafe import HiringCafeScraper, HiringCafeScraperConfig
-from jobpipe.scrapers.wellfound import WellfoundScraper, WellfoundScraperConfig
 from jobpipe.storage.db import initialize_database
+from jobpipe.storage.models import JobRecord
 from jobpipe.storage.repository import JobRepository
 
 LOGGER = logging.getLogger(__name__)
@@ -29,12 +30,26 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class RunSummary:
-    scraped: int
+    ingested: int
     inserted: int
     updated: int
     scored: int
     above_threshold: int
     notified: int
+
+
+@dataclass(slots=True)
+class ScoreSummary:
+    scored: int
+    above_threshold: int
+    notified: int
+
+
+@dataclass(slots=True)
+class IngestBatchResult:
+    run_id: str
+    summary: RunSummary
+    scoring_in_progress: bool = False
 
 
 class RunAlreadyInProgressError(RuntimeError):
@@ -90,281 +105,298 @@ def _release_run_lock(lock_path: Path) -> None:
         pass
 
 
-def _build_scrapers(settings: Settings) -> list[tuple[str, JobScraper]]:
-    scrapers: list[tuple[str, JobScraper]] = [
-        (
-            "hiringcafe",
-            HiringCafeScraper(
-                HiringCafeScraperConfig(
-                    base_url=settings.hiringcafe_base_url,
-                    search_urls=tuple(settings.platform_search_urls("hiringcafe")),
-                    storage_state=settings.hiringcafe_storage_state,
-                    headless=settings.hiringcafe_headless,
-                    jitter_min=settings.hiringcafe_jitter_min,
-                    jitter_max=settings.hiringcafe_jitter_max,
-                    fetch_detail_descriptions=settings.hiringcafe_fetch_detail_descriptions,
-                    user_agents=tuple(settings.platform_user_agents("hiringcafe")),
-                    require_usable_auth_state=settings.require_usable_auth_state,
+def score_pending_jobs(
+    settings: Settings,
+    repository: JobRepository,
+    run_id: str | None = None,
+    limit: int = 500,
+) -> ScoreSummary:
+    cv_text = _load_master_cv(settings.master_cv_path)
+    if not cv_text.strip():
+        raise MissingMasterCVError(
+            f"Master CV is missing or empty at {settings.master_cv_path}. "
+            "Create it or set JOBPIPE_MASTER_CV_PATH."
+        )
+
+    scored = 0
+    updates: list[tuple] = []
+    to_score_jobs: list[JobRecord] = []
+    to_score_meta: list[tuple[JobRecord, int | None, bool]] = []
+
+    for job in repository.list_jobs_for_scoring(limit=limit):
+        years_required = extract_years_required(job.description)
+        is_remote = bool(infer_remote(f"{job.title} {job.description}"))
+
+        if should_discard_for_senior_role(
+            required_years=years_required,
+            user_years_experience=settings.user_years_experience,
+        ):
+            LOGGER.info(
+                "Job rejected: senior role requires %s years, user has %s",
+                years_required,
+                settings.user_years_experience,
+            )
+            updates.append(
+                (
+                    0.0,
+                    years_required,
+                    is_remote,
+                    "Rejected",
+                    0.0,
+                    0.0,
+                    0.0,
+                    job.id,
                 )
-            ),
-        )
-    ]
-
-    if settings.wellfound_enabled:
-        scrapers.append(
-            (
-                "wellfound",
-                WellfoundScraper(
-                    WellfoundScraperConfig(
-                        base_url=settings.wellfound_base_url,
-                        search_urls=tuple(settings.platform_search_urls("wellfound")),
-                        storage_state=settings.wellfound_storage_state,
-                        headless=settings.wellfound_headless,
-                        jitter_min=settings.wellfound_jitter_min,
-                        jitter_max=settings.wellfound_jitter_max,
-                        fetch_detail_descriptions=settings.wellfound_fetch_detail_descriptions,
-                        user_agents=tuple(settings.platform_user_agents("wellfound")),
-                        require_usable_auth_state=settings.require_usable_auth_state,
-                    )
-                ),
             )
+            scored += 1
+            continue
+
+        to_score_jobs.append(job)
+        to_score_meta.append((job, years_required, is_remote))
+
+    if to_score_jobs:
+        embedder = LocalEmbedder(
+            settings.embed_model,
+            batch_size=settings.embed_batch_size,
+        )
+        cv_vector = embedder.embed_text(cv_text)
+        relevance_values = relevance_scores(
+            [job.description for job in to_score_jobs],
+            cv_vector,
+            embedder,
         )
 
-    if settings.builtin_enabled:
-        scrapers.append(
-            (
-                "builtin",
-                BuiltInScraper(
-                    BuiltInScraperConfig(
-                        base_url=settings.builtin_base_url,
-                        search_urls=tuple(settings.platform_search_urls("builtin")),
-                        storage_state=settings.builtin_storage_state,
-                        headless=settings.builtin_headless,
-                        jitter_min=settings.builtin_jitter_min,
-                        jitter_max=settings.builtin_jitter_max,
-                        fetch_detail_descriptions=settings.builtin_fetch_detail_descriptions,
-                        user_agents=tuple(settings.platform_user_agents("builtin")),
-                        require_usable_auth_state=settings.require_usable_auth_state,
-                    )
-                ),
+        for (job, years_required, is_remote), relevance in zip(
+            to_score_meta, relevance_values
+        ):
+            attainability_score_value, attainability_details = attainability_score(
+                required_years=years_required,
+                user_years_experience=settings.user_years_experience,
             )
-        )
+            recency = recency_score(job.date_posted, is_remote)
+            breakdown = compute_total_match_score(
+                relevance=relevance,
+                attainability=attainability_score_value,
+                recency=recency,
+            )
 
-    return scrapers
+            updates.append(
+                (
+                    breakdown.total,
+                    years_required,
+                    is_remote,
+                    "Queued",
+                    breakdown.relevance,
+                    breakdown.attainability,
+                    breakdown.recency,
+                    job.id,
+                )
+            )
+            scored += 1
+
+    repository.update_scoring_bulk(updates)
+
+    above_threshold_jobs = repository.list_jobs_above_threshold(
+        settings.notification_threshold
+    )
+    jobs_to_notify = repository.list_jobs_to_notify(settings.notification_threshold)
+
+    notified_ids: list[str] = []
+    for job in jobs_to_notify:
+        if job.match_score is None:
+            continue
+
+        try:
+            delivery = notify_job_match(
+                title=job.title,
+                company=job.company,
+                score=job.match_score,
+                url=job.url,
+            )
+            if not delivery.clickable and not delivery.url_opened:
+                LOGGER.warning(
+                    "Notification fallback used for job %s (backend=%s)",
+                    job.id,
+                    delivery.backend,
+                )
+            elif not delivery.clickable and delivery.url_opened:
+                LOGGER.info(
+                    "Notification used URL-open fallback for job %s (backend=%s)",
+                    job.id,
+                    delivery.backend,
+                )
+            repository.record_notification_event(
+                run_id=run_id,
+                job_id=job.id,
+                title=job.title,
+                company=job.company,
+                score=job.match_score,
+                url=job.url,
+                delivery_status=f"{delivery.delivery_status}:{delivery.backend}",
+            )
+            notified_ids.append(job.id)
+        except Exception as exc:
+            repository.record_notification_event(
+                run_id=run_id,
+                job_id=job.id,
+                title=job.title,
+                company=job.company,
+                score=job.match_score,
+                url=job.url,
+                delivery_status="Failed",
+                error_message=str(exc),
+            )
+            LOGGER.exception("Failed notification audit write for job %s", job.id)
+
+    repository.mark_notified(notified_ids)
+
+    if settings.auto_stage_job_description:
+        try:
+            staged = stage_job_description(
+                repository=repository,
+                output_path=settings.job_description_path,
+                minimum_score=settings.notification_threshold,
+            )
+            LOGGER.info(
+                "Auto-staged job description | job=%s title=%s company=%s path=%s",
+                staged.job_id,
+                staged.title,
+                staged.company,
+                staged.output_path,
+            )
+        except ResumeTargetNotFoundError:
+            LOGGER.info(
+                "Auto-stage enabled but no resume target met threshold %.3f",
+                settings.notification_threshold,
+            )
+        except Exception:
+            LOGGER.exception("Auto-stage failed unexpectedly")
+
+    return ScoreSummary(
+        scored=scored,
+        above_threshold=len(above_threshold_jobs),
+        notified=len(notified_ids),
+    )
 
 
-async def run_once(settings: Settings, max_pages: int = 1) -> RunSummary:
-    settings.validate_scraping_runtime()
+def process_ingest_batch(settings: Settings, jobs: list[JobRecord]) -> IngestBatchResult:
+    settings.validate_runtime()
     settings.ensure_runtime_dirs()
     lock_acquired = False
+    release_lock = True
+    repository: JobRepository | None = None
+    run_id: str | None = None
 
     try:
+        LOGGER.info("process_ingest_batch | Starting with %d jobs", len(jobs))
         _acquire_run_lock(settings.run_lock_path, settings.run_lock_stale_seconds)
         lock_acquired = True
 
         initialize_database(settings.db_path)
 
         repository = JobRepository(settings.db_path)
-        run_id = f"run-{uuid4().hex[:12]}"
+        run_id = f"ingest-{uuid4().hex[:12]}"
         repository.create_scrape_run(run_id)
 
-        try:
-            scraped_jobs = []
-            for platform_name, scraper in _build_scrapers(settings):
-                try:
-                    platform_jobs = await scraper.scrape(max_pages=max_pages)
-                except UnusableStorageStateError:
-                    LOGGER.exception(
-                        "Strict auth-state failure for platform %s",
-                        platform_name,
-                    )
-                    raise
-                except Exception:
-                    LOGGER.exception("Scraper failure for platform %s", platform_name)
-                    continue
+        inserted, updated = repository.upsert_jobs(jobs)
+        LOGGER.info(
+            "process_ingest_batch | Upsert complete: %d inserted, %d updated",
+            inserted,
+            updated,
+        )
 
-                LOGGER.info(
-                    "Scraped %s jobs from %s",
-                    len(platform_jobs),
-                    platform_name,
-                )
-                scraped_jobs.extend(platform_jobs)
-
-            inserted, updated = repository.upsert_jobs(scraped_jobs)
-
-            cv_text = _load_master_cv(settings.master_cv_path)
-            if not cv_text.strip():
-                raise MissingMasterCVError(
-                    f"Master CV is missing or empty at {settings.master_cv_path}. "
-                    "Create it or set JOBPIPE_MASTER_CV_PATH."
-                )
-            scored = 0
-
-            embedder = LocalEmbedder(settings.embed_model)
-
-            for job in repository.list_jobs_for_scoring(limit=500):
-                if not passes_prefilter(
-                    title=job.title,
-                    description=job.description,
-                    critical_skills=settings.critical_skills,
-                    reject_terms=settings.reject_terms,
-                ):
-                    repository.update_scoring(
-                        job_id=job.id,
-                        match_score=0.0,
-                        years_required=extract_years_required(job.description),
-                        is_remote=infer_remote(f"{job.title} {job.description}"),
-                        status="Rejected",
-                        score_relevance=0.0,
-                        score_attainability=0.0,
-                        score_recency=0.0,
-                    )
-                    scored += 1
-                    continue
-
-                years_required = extract_years_required(job.description)
-                is_remote = infer_remote(f"{job.title} {job.description}")
-
-                if should_discard_for_senior_role(
-                    required_years=years_required,
-                    user_years_experience=settings.user_years_experience,
-                ):
-                    repository.update_scoring(
-                        job_id=job.id,
-                        match_score=0.0,
-                        years_required=years_required,
-                        is_remote=is_remote,
-                        status="Rejected",
-                        score_relevance=0.0,
-                        score_attainability=0.0,
-                        score_recency=0.0,
-                    )
-                    scored += 1
-                    continue
-
-                relevance = relevance_score(job.description, cv_text, embedder)
-                attainability = attainability_score(
-                    required_years=years_required,
-                    user_years_experience=settings.user_years_experience,
-                )
-
-                recency = recency_score(job.date_posted, is_remote)
-                breakdown = compute_total_match_score(
-                    relevance=relevance,
-                    attainability=attainability,
-                    recency=recency,
-                )
-
-                repository.update_scoring(
-                    job_id=job.id,
-                    match_score=breakdown.total,
-                    years_required=years_required,
-                    is_remote=is_remote,
-                    status="Queued",
-                    score_relevance=breakdown.relevance,
-                    score_attainability=breakdown.attainability,
-                    score_recency=breakdown.recency,
-                )
-                scored += 1
-
-            above_threshold_jobs = repository.list_jobs_above_threshold(settings.notification_threshold)
-            jobs_to_notify = repository.list_jobs_to_notify(settings.notification_threshold)
-
-            notified_ids: list[str] = []
-            for job in jobs_to_notify:
-                if job.match_score is None:
-                    continue
-
-                try:
-                    delivery = notify_job_match(
-                        title=job.title,
-                        company=job.company,
-                        score=job.match_score,
-                        url=job.url,
-                    )
-                    if not delivery.clickable and not delivery.url_opened:
-                        LOGGER.warning(
-                            "Notification fallback used for job %s (backend=%s)",
-                            job.id,
-                            delivery.backend,
-                        )
-                    elif not delivery.clickable and delivery.url_opened:
-                        LOGGER.info(
-                            "Notification used URL-open fallback for job %s (backend=%s)",
-                            job.id,
-                            delivery.backend,
-                        )
-                    repository.record_notification_event(
-                        run_id=run_id,
-                        job_id=job.id,
-                        title=job.title,
-                        company=job.company,
-                        score=job.match_score,
-                        url=job.url,
-                        delivery_status=f"{delivery.delivery_status}:{delivery.backend}",
-                    )
-                    notified_ids.append(job.id)
-                except Exception as exc:
-                    repository.record_notification_event(
-                        run_id=run_id,
-                        job_id=job.id,
-                        title=job.title,
-                        company=job.company,
-                        score=job.match_score,
-                        url=job.url,
-                        delivery_status="Failed",
-                        error_message=str(exc),
-                    )
-                    LOGGER.exception("Failed notification audit write for job %s", job.id)
-
-            repository.mark_notified(notified_ids)
-
-            if settings.auto_stage_job_description:
-                try:
-                    staged = stage_job_description(
-                        repository=repository,
-                        output_path=settings.job_description_path,
-                        minimum_score=settings.notification_threshold,
-                    )
-                    LOGGER.info(
-                        "Auto-staged job description | job=%s title=%s company=%s path=%s",
-                        staged.job_id,
-                        staged.title,
-                        staged.company,
-                        staged.output_path,
-                    )
-                except ResumeTargetNotFoundError:
-                    LOGGER.info(
-                        "Auto-stage enabled but no resume target met threshold %.3f",
-                        settings.notification_threshold,
-                    )
-                except Exception:
-                    LOGGER.exception("Auto-stage failed unexpectedly")
-
-            summary = RunSummary(
-                scraped=len(scraped_jobs),
+        if settings.score_async:
+            repository.update_scrape_run_ingest(
+                run_id=run_id,
+                scraped=len(jobs),
                 inserted=inserted,
                 updated=updated,
-                scored=scored,
-                above_threshold=len(above_threshold_jobs),
-                notified=len(notified_ids),
             )
-            repository.complete_scrape_run(
-                run_id=run_id,
-                scraped=summary.scraped,
-                inserted=summary.inserted,
-                updated=summary.updated,
-                scored=summary.scored,
-                above_threshold=summary.above_threshold,
-                notified=summary.notified,
+
+            def _score_and_finalize() -> None:
+                try:
+                    score_summary = score_pending_jobs(
+                        settings,
+                        JobRepository(settings.db_path),
+                        run_id=run_id,
+                    )
+                    summary = RunSummary(
+                        ingested=len(jobs),
+                        inserted=inserted,
+                        updated=updated,
+                        scored=score_summary.scored,
+                        above_threshold=score_summary.above_threshold,
+                        notified=score_summary.notified,
+                    )
+                    JobRepository(settings.db_path).complete_scrape_run(
+                        run_id=run_id,
+                        scraped=summary.ingested,
+                        inserted=summary.inserted,
+                        updated=summary.updated,
+                        scored=summary.scored,
+                        above_threshold=summary.above_threshold,
+                        notified=summary.notified,
+                    )
+                except Exception as exc:  # pragma: no cover - background safety net
+                    LOGGER.exception("Async scoring failed for %s", run_id)
+                    try:
+                        JobRepository(settings.db_path).fail_scrape_run(
+                            run_id=run_id,
+                            error_message=str(exc),
+                        )
+                    except Exception:
+                        LOGGER.exception("Failed to persist async run failure for %s", run_id)
+                finally:
+                    _release_run_lock(settings.run_lock_path)
+
+            thread = threading.Thread(
+                target=_score_and_finalize,
+                name=f"JobPipeScoreRun-{run_id}",
+                daemon=True,
             )
-            return summary
-        except Exception as exc:
+            thread.start()
+            # Release the ingest lock immediately so new batches can arrive while
+            # scoring continues in the background.
+            _release_run_lock(settings.run_lock_path)
+            release_lock = False
+
+            summary = RunSummary(
+                ingested=len(jobs),
+                inserted=inserted,
+                updated=updated,
+                scored=0,
+                above_threshold=0,
+                notified=0,
+            )
+            return IngestBatchResult(run_id=run_id, summary=summary, scoring_in_progress=True)
+
+        score_summary = score_pending_jobs(settings, repository, run_id=run_id)
+
+        summary = RunSummary(
+            ingested=len(jobs),
+            inserted=inserted,
+            updated=updated,
+            scored=score_summary.scored,
+            above_threshold=score_summary.above_threshold,
+            notified=score_summary.notified,
+        )
+        repository.complete_scrape_run(
+            run_id=run_id,
+            scraped=summary.ingested,
+            inserted=summary.inserted,
+            updated=summary.updated,
+            scored=summary.scored,
+            above_threshold=summary.above_threshold,
+            notified=summary.notified,
+        )
+        return IngestBatchResult(run_id=run_id, summary=summary)
+    except Exception as exc:
+        if repository is not None and run_id is not None:
             try:
                 repository.fail_scrape_run(run_id=run_id, error_message=str(exc))
             except Exception:  # pragma: no cover - defensive telemetry path
-                LOGGER.exception("Failed to persist scrape run failure for %s", run_id)
-            raise
+                LOGGER.exception("Failed to persist run failure for %s", run_id)
+        raise
     finally:
-        if lock_acquired:
+        if lock_acquired and release_lock:
             _release_run_lock(settings.run_lock_path)

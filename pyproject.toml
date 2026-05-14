@@ -1,3 +1,8 @@
+# Purpose: Python project configuration for JobPipe.
+# Author: Seth Nenninger (GPT-5.2-Codex Agent)
+# Timestamp: 2026-05-12T00:00:00Z
+# Changelog: Remove Playwright dependency for extension-based ingest.
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -12,7 +17,6 @@ authors = [
   { name = "JobPipe" }
 ]
 dependencies = [
-  "playwright>=1.53.0",
   "sentence-transformers>=3.0.1",
   "numpy>=1.26.4",
   "python-dateutil>=2.9.0.post0",

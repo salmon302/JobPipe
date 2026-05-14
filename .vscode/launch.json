@@ -2,49 +2,82 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Run JobPipe (module)",
-      "type": "python",
+      "name": "JobPipe: Ingest Server",
+      "type": "debugpy",
       "request": "launch",
       "module": "jobpipe",
-      "args": ["run-once", "--max-pages", "1"],
+      "args": ["ingest-server"],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true,
       "envFile": "${workspaceFolder}/.env",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}/src"
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONEXECUTABLE": "py -3.14"
       }
     },
     {
-      "name": "Run JobPipe (__main__)",
-      "type": "python",
-      "request": "launch",
-      "program": "${workspaceFolder}/src/jobpipe/__main__.py",
-      "args": ["run-once", "--max-pages", "1"],
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "justMyCode": true,
-      "env": {
-        "PYTHONPATH": "${workspaceFolder}/src"
-      }
-    },
-    {
-      "name": "Run JobPipe GUI",
-      "type": "python",
+      "name": "JobPipe: GUI",
+      "type": "debugpy",
       "request": "launch",
       "module": "jobpipe",
-      "args": ["gui", "--max-pages", "1"],
+      "args": ["gui"],
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true,
       "envFile": "${workspaceFolder}/.env",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}/src"
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONEXECUTABLE": "py -3.14"
+      }
+    },
+    {
+      "name": "JobPipe: Top Jobs",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "jobpipe",
+      "args": ["top", "--limit", "10"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONEXECUTABLE": "py -3.14"
+      }
+    },
+    {
+      "name": "JobPipe: Init DB",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "jobpipe",
+      "args": ["init-db"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONEXECUTABLE": "py -3.14"
+      }
+    },
+    {
+      "name": "JobPipe: Runs",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "jobpipe",
+      "args": ["runs"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src",
+        "PYTHONEXECUTABLE": "py -3.14"
       }
     },
     {
       "name": "Debug tests (pytest)",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "module": "pytest",
       "args": ["-q"],
@@ -57,7 +90,7 @@
     },
     {
       "name": "Attach (debugpy)",
-      "type": "python",
+      "type": "debugpy",
       "request": "attach",
       "connect": {
         "host": "localhost",

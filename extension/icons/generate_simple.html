@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Simple Icon Generator</title>
+  <style>
+    body { font-family: Arial; padding: 20px; }
+    canvas { border: 1px solid #ccc; margin: 10px; }
+    button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>JobPipe Icon Generator</h1>
+  <p>Click each button to download the icons:</p>
+
+  <div>
+    <canvas id="c16" width="16" height="16"></canvas>
+    <button onclick="dl(16)">Download 16x16</button>w
+  </div>
+  <div>
+    <canvas id="c48" width="48" height="48"></canvas>
+    <button onclick="dl(48)">Download 48x48</button>
+  </div>
+  <div>
+    <canvas id="c128" width="128" height="128"></canvas>
+    <button onclick="dl(128)">Download 128x128</button>
+  </div>
+
+  <script>
+    function draw(canvasId) {
+      const canvas = document.getElementById(canvasId);
+      const ctx = canvas.getContext('2d');
+      const size = canvas.width;
+
+      // Gradient background
+      const grad = ctx.createLinearGradient(0, 0, size, size);
+      grad.addColorStop(0, '#667eea');
+      grad.addColorStop(1, '#764ba2');
+      ctx.fillStyle = grad;
+
+      // Rounded rectangle
+      const r = size * 0.15;
+      ctx.beginPath();
+      ctx.moveTo(r, 0);
+      ctx.lineTo(size - r, 0);
+      ctx.quadraticCurveTo(size, 0, size, r);
+      ctx.lineTo(size, size - r);
+      ctx.quadraticCurveTo(size, size, size - r, size);
+      ctx.lineTo(r, size);
+      ctx.quadraticCurveTo(0, size, 0, size - r);
+      ctx.lineTo(0, r);
+      ctx.quadraticCurveTo(0, 0, r, 0);
+      ctx.closePath();
+      ctx.fill();
+
+      // Text
+      ctx.fillStyle = 'white';
+      ctx.font = `bold ${size * 0.4}px Arial`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('JP', size / 2, size / 2);
+    }
+
+    function dl(size) {
+      const canvas = document.getElementById('c' + size);
+      const link = document.createElement('a');
+      link.download = `icon${size}.png`;
+      link.href = canvas.toDataURL();
+      link.click();
+    }
+
+    // Draw all on load
+    ['c16', 'c48', 'c128'].forEach(draw);
+  </script>
+</body>
+</html>

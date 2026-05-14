@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JobPipe Harvester</title>
+  <style>
+    body {
+      width: 320px;
+      min-height: 200px;
+      margin: 0;
+      padding: 16px;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    }
+
+    .header {
+      text-align: center;
+      margin-bottom: 16px;
+    }
+
+    .header h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 600;
+    }
+
+    .header p {
+      margin: 4px 0 0 0;
+      font-size: 12px;
+      opacity: 0.9;
+    }
+
+    .info-box {
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 6px;
+      padding: 10px;
+      margin-bottom: 12px;
+      font-size: 11px;
+      line-height: 1.4;
+    }
+
+    .status-indicator {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 6px;
+    }
+
+    .status-indicator.connected {
+      background: #4ade80;
+    }
+
+    .status-indicator.disconnected {
+      background: #f87171;
+    }
+
+    .status-indicator.unknown {
+      background: #fbbf24;
+    }
+
+    .status-card {
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+      backdrop-filter: blur(10px);
+    }
+
+    .status-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .status-row:last-child {
+      margin-bottom: 0;
+    }
+
+    .status-label {
+      font-size: 13px;
+      opacity: 0.9;
+    }
+
+    .status-value {
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .status-connected {
+      color: #4ade80;
+    }
+
+    .status-disconnected {
+      color: #f87171;
+    }
+
+    .status-queued {
+      color: #60a5fa;
+    }
+
+    .status-scoring {
+      color: #fbbf24;
+    }
+
+    .status-completed {
+      color: #4ade80;
+    }
+
+    .btn {
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      margin-bottom: 8px;
+    }
+
+    .btn-primary {
+      background: white;
+      color: #667eea;
+    }
+
+    .btn-primary:hover {
+      background: #f0f0f0;
+      transform: translateY(-1px);
+    }
+
+    .btn-primary:disabled {
+      background: rgba(255, 255, 255, 0.5);
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.2);
+      color: white;
+      border: 1px solid rgba(255, 255, 255, 0.3);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.3);
+    }
+
+    .btn-secondary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .message {
+      padding: 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      margin-top: 8px;
+      text-align: center;
+      display: none;
+    }
+
+    .message-success {
+      background: rgba(74, 222, 128, 0.2);
+      border: 1px solid rgba(74, 222, 128, 0.5);
+      display: block;
+    }
+
+    .message-error {
+      background: rgba(248, 113, 113, 0.2);
+      border: 1px solid rgba(248, 113, 113, 0.5);
+      display: block;
+    }
+
+    .settings-section {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid rgba(255, 255, 255, 0.2);
+    }
+
+    .settings-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .settings-label {
+      font-size: 12px;
+      opacity: 0.9;
+    }
+
+    .settings-input {
+      background: rgba(255, 255, 255, 0.2);
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      border-radius: 4px;
+      padding: 4px 8px;
+      color: white;
+      font-size: 12px;
+      width: 120px;
+    }
+
+    .settings-input::placeholder {
+      color: rgba(255, 255, 255, 0.5);
+    }
+
+    .toggle-switch {
+      position: relative;
+      display: inline-block;
+      width: 40px;
+      height: 20px;
+    }
+
+    .toggle-switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .toggle-slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: rgba(255, 255, 255, 0.3);
+      transition: 0.3s;
+      border-radius: 20px;
+    }
+
+    .toggle-slider:before {
+      position: absolute;
+      content: "";
+      height: 16px;
+      width: 16px;
+      left: 2px;
+      bottom: 2px;
+      background-color: white;
+      transition: 0.3s;
+      border-radius: 50%;
+    }
+
+    .toggle-switch input:checked + .toggle-slider {
+      background-color: #4ade80;
+    }
+
+    .toggle-switch input:checked + .toggle-slider:before {
+      transform: translateX(20px);
+    }
+
+    #scrapeStatusCard {
+      background: rgba(255, 255, 255, 0.2);
+    }
+
+    .status-value.status-scraping {
+      color: #fbbf24;
+    }
+
+    .status-value.status-success {
+      color: #4ade80;
+    }
+
+    .status-value.status-error {
+      color: #f87171;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>🌊 JobPipe Harvester</h1>
+    <p>Capture jobs from active browsing</p>
+  </div>
+
+  <div class="info-box">
+    <strong>How to use:</strong><br>
+    1. Navigate to a job board (HiringCafe, LinkedIn, etc.)<br>
+    2. Click "Capture Job" for current listing<br>
+    3. Or "Capture All Visible" for batch extraction
+  </div>
+
+  <div class="status-card">
+    <div class="status-row">
+      <span class="status-label">Server Status:</span>
+      <span class="status-value" id="serverStatus">Checking...</span>
+    </div>
+    <div class="status-row">
+      <span class="status-label">Current Page:</span>
+      <span class="status-value" id="pageStatus">Loading...</span>
+    </div>
+    <div class="status-row">
+      <span class="status-label">Auto-Scrape:</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="autoScrapeToggle">
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <div class="status-card" id="scrapeStatusCard" style="display: none;">
+    <div class="status-row">
+      <span class="status-label">Scraping Status:</span>
+      <span class="status-value" id="scrapeStatus">Idle</span>
+    </div>
+    <div class="status-row">
+      <span class="status-label">Jobs Found:</span>
+      <span class="status-value" id="jobsFound">0</span>
+    </div>
+    <div class="status-row">
+      <span class="status-label">Jobs Sent:</span>
+      <span class="status-value" id="jobsSent">0</span>
+    </div>
+  </div>
+
+  <button class="btn btn-primary" id="captureBtn" disabled>
+    📥 Capture Job Listing
+  </button>
+
+  <button class="btn btn-secondary" id="captureBatchBtn" disabled>
+    📦 Capture All Visible
+  </button>
+
+  <div class="settings-section">
+    <div class="settings-row">
+      <span class="settings-label">Server URL:</span>
+      <input type="text" class="settings-input" id="serverUrl" placeholder="127.0.0.1:3838">
+    </div>
+    <div class="settings-row">
+      <button class="btn btn-secondary" id="clearCacheBtn" style="font-size: 11px; padding: 6px;">
+        🗑️ Clear Cache
+      </button>
+    </div>
+  </div>
+
+  <div class="message" id="message"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

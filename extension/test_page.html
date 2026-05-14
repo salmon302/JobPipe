@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Test Job Listing - HiringCafe Style</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 50px auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    .job-card {
+      background: white;
+      border-radius: 8px;
+      padding: 24px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    h1[data-testid="job-title"] {
+      color: #333;
+      margin-bottom: 8px;
+    }
+    .company-name {
+      color: #666;
+      font-size: 18px;
+      margin-bottom: 16px;
+    }
+    .job-description {
+      line-height: 1.6;
+      color: #444;
+    }
+    .job-description h3 {
+      color: #333;
+      margin-top: 20px;
+    }
+    .job-description ul {
+      margin-left: 20px;
+    }
+    .note {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      border-radius: 4px;
+      padding: 12px;
+      margin-top: 20px;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="job-card">
+    <h1 data-testid="job-title">Senior Python Developer</h1>
+    <div class="company-name" data-testid="company-name">TechCorp Inc.</div>
+
+    <div class="job-description" data-testid="job-description">
+      <h3>About the Role</h3>
+      <p>We are seeking an experienced Python Developer to join our growing engineering team. The ideal candidate will have strong experience with Python, web frameworks, and cloud technologies.</p>
+
+      <h3>Responsibilities</h3>
+      <ul>
+        <li>Design and develop scalable Python applications</li>
+        <li>Work with FastAPI, Django, or Flask frameworks</li>
+        <li>Collaborate with cross-functional teams</li>
+        <li>Write clean, maintainable, and efficient code</li>
+        <li>Participate in code reviews and mentoring</li>
+      </ul>
+
+      <h3>Requirements</h3>
+      <ul>
+        <li>5+ years of Python development experience</li>
+        <li>Experience with web frameworks (FastAPI, Django, Flask)</li>
+        <li>Knowledge of RESTful API design</li>
+        <li>Familiarity with cloud platforms (AWS, GCP, or Azure)</li>
+        <li>Strong problem-solving skills</li>
+      </ul>
+
+      <h3>Preferred Qualifications</h3>
+      <ul>
+        <li>Experience with containerization (Docker, Kubernetes)</li>
+        <li>Knowledge of CI/CD pipelines</li>
+        <li>Contributions to open-source projects</li>
+      </ul>
+
+      <h3>Benefits</h3>
+      <ul>
+        <li>Competitive salary and equity</li>
+        <li>Remote-friendly work environment</li>
+        <li>Comprehensive health benefits</li>
+        <li>Professional development budget</li>
+      </ul>
+    </div>
+
+    <div class="note">
+      <strong>Note:</strong> This is a test page for the JobPipe browser extension.
+      Open this page and click the extension icon to capture this job listing.
+      The extension should extract the title, company, and description automatically.
+    </div>
+  </div>
+</body>
+</html>

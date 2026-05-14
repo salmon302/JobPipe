@@ -79,6 +79,71 @@ _MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE jobs ADD COLUMN score_recency REAL;
         """,
     ),
+    (
+        5,
+        """
+        ALTER TABLE jobs ADD COLUMN summary TEXT;
+        ALTER TABLE jobs ADD COLUMN requirements TEXT;
+        ALTER TABLE jobs ADD COLUMN location TEXT;
+        ALTER TABLE jobs ADD COLUMN county TEXT;
+        ALTER TABLE jobs ADD COLUMN compensation TEXT;
+        ALTER TABLE jobs ADD COLUMN workplace_type TEXT;
+        ALTER TABLE jobs ADD COLUMN employment_type TEXT;
+        ALTER TABLE jobs ADD COLUMN department TEXT;
+        ALTER TABLE jobs ADD COLUMN team TEXT;
+        ALTER TABLE jobs ADD COLUMN views INTEGER;
+        ALTER TABLE jobs ADD COLUMN saves INTEGER;
+        ALTER TABLE jobs ADD COLUMN applications INTEGER;
+        ALTER TABLE jobs ADD COLUMN posted_at TEXT;
+        ALTER TABLE jobs ADD COLUMN posted_ago TEXT;
+        """,
+    ),
+    (
+        6,
+        """
+        CREATE TABLE IF NOT EXISTS master_cv_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cv_hash TEXT NOT NULL UNIQUE,
+            file_path TEXT NOT NULL,
+            version_number INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(cv_hash)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cv_versions_hash ON master_cv_versions(cv_hash);
+        CREATE INDEX IF NOT EXISTS idx_cv_versions_created ON master_cv_versions(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS resume_variants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT,
+            variant_name TEXT NOT NULL,
+            page_length INTEGER NOT NULL DEFAULT 1 CHECK(page_length IN (1, 2)),
+            job_type TEXT,
+            target_company TEXT,
+            skills TEXT,
+            master_cv_hash TEXT NOT NULL,
+            generation_number INTEGER NOT NULL DEFAULT 1,
+            parent_variant_id INTEGER,
+            tex_path TEXT NOT NULL,
+            pdf_path TEXT,
+            ats_optimized INTEGER NOT NULL DEFAULT 0,
+            ats_score REAL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL,
+            FOREIGN KEY (master_cv_hash) REFERENCES master_cv_versions(cv_hash) ON DELETE CASCADE,
+            FOREIGN KEY (parent_variant_id) REFERENCES resume_variants(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_variants_job ON resume_variants(job_id);
+        CREATE INDEX IF NOT EXISTS idx_variants_company ON resume_variants(target_company);
+        CREATE INDEX IF NOT EXISTS idx_variants_type ON resume_variants(job_type);
+        CREATE INDEX IF NOT EXISTS idx_variants_page ON resume_variants(page_length);
+        CREATE INDEX IF NOT EXISTS idx_variants_cv_hash ON resume_variants(master_cv_hash);
+        CREATE INDEX IF NOT EXISTS idx_variants_parent ON resume_variants(parent_variant_id);
+        CREATE INDEX IF NOT EXISTS idx_variants_created ON resume_variants(created_at DESC);
+        """,
+    ),
 ]
 
 

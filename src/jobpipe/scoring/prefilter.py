@@ -31,6 +31,8 @@ def has_reject_terms(text: str, reject_terms: list[str]) -> bool:
         if not term_norm:
             continue
 
+        # Use word boundary but also check that we're not matching inside a longer word
+        # e.g., "senior" should match "senior" but not be part of another word
         pattern = re.compile(rf"\b{re.escape(term_norm)}\b")
         if pattern.search(normalized):
             return True
@@ -44,9 +46,16 @@ def passes_prefilter(
     critical_skills: list[str],
     reject_terms: list[str],
 ) -> bool:
-    combined = f"{title} {description}"
-
-    if has_reject_terms(combined, reject_terms):
+    # Only check reject_terms against title and first 500 chars of description
+    # to avoid over-matching on common words that appear in job descriptions
+    title_desc = f"{title} {description[:500]}"
+    
+    if has_reject_terms(title_desc, reject_terms):
         return False
 
+    # If no critical skills defined, don't filter based on skills
+    if not critical_skills:
+        return True
+
+    combined = f"{title} {description}"
     return len(critical_skill_hits(combined, critical_skills)) > 0

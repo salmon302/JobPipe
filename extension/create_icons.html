@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JobPipe Icon Generator</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 50px auto;
+      padding: 20px;
+    }
+    .icon-preview {
+      display: inline-block;
+      margin: 20px;
+      text-align: center;
+    }
+    canvas {
+      border: 1px solid #ccc;
+      margin: 10px;
+    }
+    button {
+      padding: 10px 20px;
+      font-size: 16px;
+      cursor: pointer;
+      background: #667eea;
+      color: white;
+      border: none;
+      border-radius: 5px;
+    }
+    button:hover {
+      background: #764ba2;
+    }
+  </style>
+</head>
+<body>
+  <h1>JobPipe Extension Icon Generator</h1>
+  <p>Click the buttons below to generate and download icons for the browser extension.</p>
+
+  <div class="icon-preview">
+    <h3>16x16</h3>
+    <canvas id="canvas16" width="16" height="16"></canvas>
+    <br>
+    <button onclick="downloadIcon(16)">Download icon16.png</button>
+  </div>
+
+  <div class="icon-preview">
+    <h3>48x48</h3>
+    <canvas id="canvas48" width="48" height="48"></canvas>
+    <br>
+    <button onclick="downloadIcon(48)">Download icon48.png</button>
+  </div>
+
+  <div class="icon-preview">
+    <h3>128x128</h3>
+    <canvas id="canvas128" width="128" height="128"></canvas>
+    <br>
+    <button onclick="downloadIcon(128)">Download icon128.png</button>
+  </div>
+
+  <script>
+    // Generate icons on load
+    window.onload = function() {
+      generateIcon(16);
+      generateIcon(48);
+      generateIcon(128);
+    };
+
+    function generateIcon(size) {
+      const canvas = document.getElementById(`canvas${size}`);
+      const ctx = canvas.getContext('2d');
+
+      // Create gradient background
+      const gradient = ctx.createLinearGradient(0, 0, size, size);
+      gradient.addColorStop(0, '#667eea');
+      gradient.addColorStop(1, '#764ba2');
+
+      // Fill background with rounded rectangle
+      ctx.fillStyle = gradient;
+      roundRect(ctx, 0, 0, size, size, size * 0.15);
+      ctx.fill();
+
+      // Draw "JP" text
+      ctx.fillStyle = 'white';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+
+      // Adjust font size based on icon size
+      const fontSize = size * 0.4;
+      ctx.font = `bold ${fontSize}px Arial, sans-serif`;
+
+      // Draw text
+      ctx.fillText('JP', size / 2, size / 2);
+    }
+
+    function roundRect(ctx, x, y, width, height, radius) {
+      ctx.beginPath();
+      ctx.moveTo(x + radius, y);
+      ctx.lineTo(x + width - radius, y);
+      ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+      ctx.lineTo(x + width, y + height - radius);
+      ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+      ctx.lineTo(x + radius, y + height);
+      ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+      ctx.lineTo(x, y + radius);
+      ctx.quadraticCurveTo(x, y, x + radius, y);
+      ctx.closePath();
+    }
+
+    function downloadIcon(size) {
+      const canvas = document.getElementById(`canvas${size}`);
+      const link = document.createElement('a');
+      link.download = `icon${size}.png`;
+      link.href = canvas.toDataURL('image/png');
+      link.click();
+    }
+  </script>
+</body>
+</html>

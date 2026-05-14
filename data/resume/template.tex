@@ -1,0 +1,61 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=0.5in]{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{xcolor}
+
+% Formatting
+\titleformat{\section}{\large\bfseries\color{blue!70!black}}{}{0em}{}[\titlerule]
+\titlespacing{\section}{0pt}{10pt}{5pt}
+\setlist[itemize]{noitemsep, topsep=0pt, leftmargin=*}
+
+% Remove page numbering
+\pagestyle{empty}
+
+\begin{document}
+
+% Header
+\begin{center}
+    {\Huge \textbf{Your Name}}\\
+    \vspace{4pt}
+    Your Location \textbullet\ Email \textbullet\ Phone\\
+    \href{https://linkedin.com/in/yourprofile}{linkedin.com/in/yourprofile} \textbullet\ \href{https://github.com/yourusername}{github.com/yourusername}
+\end{center}
+
+\vspace{-8pt}
+
+% Summary
+\section*{Summary}
+Brief professional summary tailored to the job description. Highlight key skills and years of experience relevant to the role.
+
+% Experience
+\section*{Experience}
+\textbf{Job Title} \hfill Dates\\
+\textit{Company Name, Location}
+\begin{itemize}
+    \item Achievement or responsibility relevant to the target job
+    \item Quantifiable result or impact statement
+    \item Skill or technology used in the role
+\end{itemize}
+
+\textbf{Previous Job Title} \hfill Dates\\
+\textit{Previous Company, Location}
+\begin{itemize}
+    \item Relevant achievement or responsibility
+    \item Another key contribution
+\end{itemize}
+
+% Skills
+\section*{Skills}
+\textbf{Programming Languages:} List relevant languages\\
+\textbf{Frameworks \& Libraries:} List relevant frameworks\\
+\textbf{Tools \& Technologies:} List relevant tools
+
+% Education
+\section*{Education}
+\textbf{Degree Name} \hfill Graduation Date\\
+\textit{University Name, Location}\\
+Relevant coursework or honors (optional)
+
+\end{document}
