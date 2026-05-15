@@ -224,6 +224,85 @@ class GeminiClient:
 
         raise last_error or GeminiAPIError("Failed to generate resume after retries")
 
+    def generate_text(
+        self,
+        prompt: str,
+        temperature: float = 0.3,
+        max_output_tokens: int = 1024,
+    ) -> str:
+        """Generate text using Gemini API for general prompts.
+
+        Args:
+            prompt: The text prompt to send to Gemini.
+            temperature: Creativity level (0.0 = deterministic, 1.0 = very creative).
+            max_output_tokens: Maximum tokens in the response.
+
+        Returns:
+            Generated text response.
+
+        Raises:
+            GeminiAPIError: If the API call fails.
+        """
+        url = f"{self._config.base_url}/models/{self._config.model}:generateContent"
+        headers = {
+            "Content-Type": "application/json",
+            "X-goog-api-key": self._config.api_key,
+        }
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt},
+                    ],
+                },
+            ],
+            "generationConfig": {
+                "temperature": temperature,
+                "topK": 40,
+                "topP": 0.95,
+                "maxOutputTokens": max_output_tokens,
+            },
+        }
+
+        last_error = None
+        for attempt in range(1, self._config.max_retries + 1):
+            try:
+                response = self._session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self._config.timeout_seconds,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                # Extract text from response
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    raise GeminiAPIError("No candidates in API response")
+
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if not parts:
+                    raise GeminiAPIError("No content parts in API response")
+
+                generated_text = parts[0].get("text", "")
+                if not generated_text:
+                    raise GeminiAPIError("Empty text in API response")
+
+                return generated_text.strip()
+
+            except Timeout as exc:
+                last_error = GeminiAPIError(f"Request timeout: {exc}")
+            except RequestException as exc:
+                last_error = GeminiAPIError(f"Request failed: {exc}")
+            except (KeyError, IndexError) as exc:
+                last_error = GeminiAPIError(f"Unexpected API response format: {exc}")
+
+            if attempt < self._config.max_retries:
+                time.sleep(self._config.retry_delay_seconds * attempt)
+
+        raise last_error or GeminiAPIError("Failed to generate text after retries")
+
     def health_check(self) -> bool:
         """Check if Gemini API is accessible."""
         try:

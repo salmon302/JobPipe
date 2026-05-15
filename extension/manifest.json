@@ -16,6 +16,7 @@
     "https://*.linkedin.com/*",
     "https://*.builtin.com/*",
     "https://*.wellfound.com/*",
+    "https://*.indeed.com/*",
     "<all_urls>"
   ],
   "background": {
@@ -27,7 +28,8 @@
         "https://*.hiring.cafe/*",
         "https://*.linkedin.com/jobs/*",
         "https://*.builtin.com/*",
-        "https://*.wellfound.com/*"
+        "https://*.wellfound.com/*",
+        "https://*.indeed.com/*"
       ],
       "js": ["content/content_script.js"],
       "run_at": "document_idle"

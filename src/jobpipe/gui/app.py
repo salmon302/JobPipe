@@ -108,12 +108,117 @@ class BackgroundActionWorker(QRunnable):
             self.signals.completed.emit()
 
 
+class RecommendSignals(QObject):
+    """Signals for the AI recommendation worker."""
+    succeeded = Signal(str)  # recommendation text
+    failed = Signal(str)  # error message
+    completed = Signal()
+
+
+class RecommendWorker(QRunnable):
+    """Worker for generating AI recommendations in background thread."""
+
+    def __init__(self, service: JobPipeGuiService, top_jobs: list) -> None:
+        super().__init__()
+        self._service = service
+        self._top_jobs = top_jobs
+        self.signals = RecommendSignals()
+
+
+class AIRecommendPanel(QWidget):
+    """Collapsible right sidebar panel for AI recommendations (Copilot style)."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._job_ids: list[str] = []  # Track which jobs were recommended
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        # Header with title and collapse button
+        header_layout = QHBoxLayout()
+        title = QLabel("✨ AI Recommendations")
+        title.setObjectName("cardTitle")
+        title.setStyleSheet("color: #e94560; font-weight: bold;")
+        header_layout.addWidget(title)
+        header_layout.addStretch(1)
+
+        self._collapse_btn = QPushButton("◀")
+        self._collapse_btn.setMaximumWidth(30)
+        self._collapse_btn.setToolTip("Collapse panel")
+        self._collapse_btn.clicked.connect(self._toggle_collapse)
+        header_layout.addWidget(self._collapse_btn)
+        layout.addLayout(header_layout)
+
+        # Recommendation text display
+        self._text_display = QPlainTextEdit()
+        self._text_display.setReadOnly(True)
+        self._text_display.setPlaceholderText("Click 'AI Recommend' to generate recommendations...")
+        self._text_display.setMaximumHeight(300)
+        layout.addWidget(self._text_display)
+
+        # AI Picks section
+        picks_label = QLabel("AI Picks:")
+        picks_label.setObjectName("cardTitle")
+        picks_label.setStyleSheet("color: #a0a0a0; font-size: 9pt;")
+        layout.addWidget(picks_label)
+
+        self._picks_list = QPlainTextEdit()
+        self._picks_list.setReadOnly(True)
+        self._picks_list.setMaximumHeight(150)
+        self._picks_list.setPlaceholderText("Top picks will appear here...")
+        layout.addWidget(self._picks_list)
+
+        self.setStyleSheet("""
+            AIRecommendPanel {
+                background: #1a1a2e;
+                border-left: 2px solid #533483;
+            }
+        """)
+
+    def _toggle_collapse(self) -> None:
+        """Toggle panel visibility."""
+        is_visible = self._text_display.isVisible()
+        self._text_display.setVisible(not is_visible)
+        self._picks_list.setVisible(not is_visible)
+        self._collapse_btn.setText("▶" if is_visible else "◀")
+        self._collapse_btn.setToolTip("Expand panel" if is_visible else "Collapse panel")
+
+    def update_recommendations(self, text: str, job_ids: list[str]) -> None:
+        """Update the panel with new recommendations."""
+        self._job_ids = job_ids
+        self._text_display.setPlainText(text)
+
+        # Extract job titles from recommendations for the picks list
+        picks = []
+        for i, job_id in enumerate(job_ids[:5], 1):  # Top 5
+            picks.append(f"{i}. Job ID: {job_id}")
+        self._picks_list.setPlainText("\n".join(picks))
+
+    def get_job_ids(self) -> list[str]:
+        """Return the list of AI-picked job IDs."""
+        return self._job_ids
+
+    def run(self) -> None:
+        try:
+            recommendation = self._service.generate_ai_recommendations(self._top_jobs)
+            self.signals.succeeded.emit(recommendation)
+        except Exception as exc:
+            self.signals.failed.emit(str(exc))
+        finally:
+            self.signals.completed.emit()
+
+
 class JobPipeMainWindow(QMainWindow):
     def __init__(self, service: JobPipeGuiService) -> None:
         super().__init__()
         self._service = service
         self._thread_pool = QThreadPool(self)
         self._resume_busy = False
+        self._recommend_busy = False  # Separate flag for AI recommendations
         self._current_resume_worker: BackgroundActionWorker | None = None
         self._ingest_server: IngestServer | None = None
         self._intro_animation: QPropertyAnimation | None = None
@@ -768,6 +873,12 @@ class JobPipeMainWindow(QMainWindow):
         clear_button.clicked.connect(self._clear_jobs)
         controls.addWidget(clear_button)
 
+        # AI Recommend button
+        self._recommend_button = QPushButton("AI Recommend")
+        self._recommend_button.setObjectName("primaryButton")
+        self._recommend_button.clicked.connect(self._get_ai_recommendations)
+        controls.addWidget(self._recommend_button)
+
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -891,11 +1002,11 @@ class JobPipeMainWindow(QMainWindow):
         sidebar_layout.addStretch(1)
         body_splitter.addWidget(sidebar)
 
-        # -- Right panel: table + details --
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(6)
+        # -- Middle panel: table + details --
+        middle_panel = QWidget()
+        middle_layout = QVBoxLayout(middle_panel)
+        middle_layout.setContentsMargins(0, 0, 0, 0)
+        middle_layout.setSpacing(6)
 
         vert_splitter = QSplitter(Qt.Orientation.Vertical)
         vert_splitter.addWidget(self._jobs_table)
@@ -917,11 +1028,22 @@ class JobPipeMainWindow(QMainWindow):
         vert_splitter.setStretchFactor(0, 3)
         vert_splitter.setStretchFactor(1, 1)
 
-        right_layout.addWidget(vert_splitter)
-        body_splitter.addWidget(right_panel)
+        middle_layout.addWidget(vert_splitter)
+        body_splitter.addWidget(middle_panel)
 
-        body_splitter.setStretchFactor(0, 0)
-        body_splitter.setStretchFactor(1, 1)
+        # -- Right panel: AI Recommendations (collapsible) --
+        self._ai_panel = AIRecommendPanel()
+        self._ai_panel.setVisible(False)  # Hidden by default
+        body_splitter.addWidget(self._ai_panel)
+
+        # Connect panel visibility changes to adjust splitter
+        self._ai_panel._collapse_btn.clicked.connect(
+            lambda: self._adjust_splitter_after_ai_panel_toggle()
+        )
+
+        body_splitter.setStretchFactor(0, 0)  # Sidebar fixed width
+        body_splitter.setStretchFactor(1, 1)  # Middle panel expands
+        body_splitter.setStretchFactor(2, 0)  # AI panel hidden by default
         layout.addWidget(body_splitter)
 
         # Connect selection change to show details
@@ -1599,6 +1721,203 @@ class JobPipeMainWindow(QMainWindow):
         worker.signals.completed.connect(lambda: setattr(self, '_resume_busy', False))
         self._thread_pool.start(worker)
 
+    def _get_ai_recommendations(self) -> None:
+        """Generate AI recommendations for top jobs."""
+        # Check both flags - if resume operation is running, warn but allow recommend
+        if self._recommend_busy:
+            QMessageBox.information(self, "Busy", "AI recommendation is already in progress.")
+            return
+        if self._resume_busy:
+            reply = QMessageBox.question(
+                self, "Operation in Progress",
+                "A resume operation is in progress.\n\nDo you want to proceed with AI recommendation anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        # Get top 20% of jobs by match score
+        try:
+            limit = self._jobs_limit_input.value()
+            all_jobs = self._service.list_jobs(limit=limit)
+            
+            if not all_jobs:
+                QMessageBox.information(self, "No Jobs", "No jobs available to analyze.")
+                return
+            
+            # Sort by match_score descending and take top 20%
+            sorted_jobs = sorted(
+                [j for j in all_jobs if j.match_score is not None],
+                key=lambda j: j.match_score if j.match_score is not None else 0.0,
+                reverse=True
+            )
+            
+            top_count = max(1, int(len(sorted_jobs) * 0.20))  # At least 1 job
+            top_jobs = sorted_jobs[:top_count]
+            
+            if not top_jobs:
+                QMessageBox.information(self, "No Qualified Jobs", "No jobs with scores found.")
+                return
+            
+            self._recommend_busy = True
+            self._recommend_button.setEnabled(False)
+            self.statusBar().showMessage(f"Generating AI recommendations for top {len(top_jobs)} jobs...")
+            self._append_log(f"Requesting AI recommendations for top {len(top_jobs)} jobs (out of {len(all_jobs)} total)...")
+            
+            # Store job IDs for highlighting/sorting later
+            self._last_recommend_job_ids = [job.id for job in top_jobs]
+            
+            worker = RecommendWorker(self._service, top_jobs)
+            worker.signals.succeeded.connect(self._on_recommend_finished)
+            worker.signals.failed.connect(self._on_recommend_error)
+            worker.signals.completed.connect(self._on_recommend_completed)
+            self._thread_pool.start(worker)
+            
+            # Safety timeout: auto-reset flag after 2 minutes (in case worker hangs)
+            QTimer.singleShot(120000, lambda: self._reset_recommend_flag_if_stuck())
+            
+        except Exception as exc:
+            self._append_log(f"Error preparing recommendations: {exc}")
+            QMessageBox.warning(self, "Error", f"Failed to prepare recommendations: {exc}")
+            self._recommend_busy = False
+
+    def _reset_recommend_flag_if_stuck(self) -> None:
+        """Safety method to reset recommend_busy flag if worker gets stuck."""
+        if self._recommend_busy:
+            self._append_log("Warning: Auto-resetting stuck recommend flag")
+            self._recommend_busy = False
+            self._recommend_button.setEnabled(True)
+            self.statusBar().showMessage("Recommendation timed out")
+
+    def _on_recommend_finished(self, recommendation: str) -> None:
+        """Handle successful AI recommendation generation."""
+        self._append_log("AI recommendations received successfully")
+        
+        # Extract job IDs from the top_jobs that were sent to AI
+        # (We need to store these during the request)
+        top_job_ids = getattr(self, '_last_recommend_job_ids', [])
+        
+        # Update the AI Recommendation panel (right sidebar)
+        if hasattr(self, '_ai_panel'):
+            self._ai_panel.update_recommendations(recommendation, top_job_ids)
+            self._ai_panel.setVisible(True)
+            self._ai_panel.raise_()  # Bring panel to front
+            self._ai_panel.update()  # Force UI update
+            self._append_log(f"AI panel visible: {self._ai_panel.isVisible()}")
+            self._append_log(f"AI panel size: {self._ai_panel.size().width()}x{self._ai_panel.size().height()}")
+            
+            # Force splitter to allocate space for the panel
+            self._force_splitter_show_panel()
+        
+        # Highlight AI picks in the table
+        self._highlight_ai_picks(top_job_ids)
+        
+        # Auto-sort table to bring AI picks to top
+        self._resort_by_ai_picks(top_job_ids)
+        
+        self.statusBar().showMessage("AI recommendations ready - check right panel")
+
+    def _on_recommend_error(self, error: str) -> None:
+        """Handle AI recommendation error."""
+        self._append_log(f"AI recommendation failed: {error}")
+        QMessageBox.warning(self, "AI Recommendation Failed", f"Failed to generate recommendations:\n{error}")
+        self.statusBar().showMessage("AI recommendation failed")
+
+    def _on_recommend_completed(self) -> None:
+        """Handle recommendation worker completion."""
+        self._recommend_busy = False
+        self._recommend_button.setEnabled(True)
+
+    def _highlight_ai_picks(self, job_ids: list[str]) -> None:
+        """Highlight the AI-picked rows with purple tint and badge."""
+        # Clear previous highlights
+        for row in range(self._jobs_table.rowCount()):
+            for col in range(self._jobs_table.columnCount()):
+                item = self._jobs_table.item(row, col)
+                if item:
+                    item.setBackground(Qt.GlobalColor.white)  # Reset
+                    if col == 5:  # Title column
+                        text = item.text()
+                        # Remove old badge if present
+                        if "✨ AI Pick" in text:
+                            item.setText(text.replace(" ✨ AI Pick", ""))
+
+        # Apply new highlights
+        ai_color = Qt.GlobalColor.cyan  # Light purple-ish tint
+        for row in range(self._jobs_table.rowCount()):
+            item = self._jobs_table.item(row, 5)  # Title column has job ID
+            if item:
+                job_id = item.data(Qt.ItemDataRole.UserRole)
+                if job_id in job_ids[:5]:  # Top 5 picks
+                    # Add purple tint to entire row
+                    for col in range(self._jobs_table.columnCount()):
+                        row_item = self._jobs_table.item(row, col)
+                        if row_item:
+                            row_item.setBackground(ai_color)
+                    # Add badge to title
+                    current_text = item.text()
+                    if "✨ AI Pick" not in current_text:
+                        item.setText(f"{current_text} ✨ AI Pick")
+
+    def _resort_by_ai_picks(self, job_ids: list[str]) -> None:
+        """Auto-sort table to bring AI picks to the top."""
+        if not job_ids:
+            return
+
+        # Temporarily disable sorting
+        self._jobs_table.setSortingEnabled(False)
+
+        # We need to re-populate the table with AI picks first
+        # For now, just ensure the table is sorted by the first column (Total score) descending
+        # The AI picks are already the top 20% by score, so they should be at top
+        self._jobs_table.setSortingEnabled(True)
+        self._jobs_table.sortItems(0, Qt.SortOrder.DescendingOrder)  # Sort by Total score
+
+    def _adjust_splitter_after_ai_panel_toggle(self) -> None:
+        """Adjust splitter sizes when AI panel is shown/hidden."""
+        if not hasattr(self, '_ai_panel'):
+            return
+
+        # Get the splitter (body_splitter)
+        splitter = self._ai_panel.parent()
+        while splitter and not isinstance(splitter, QSplitter):
+            splitter = splitter.parent() if hasattr(splitter, 'parent') else None
+
+        if splitter:
+            if self._ai_panel.isVisible():
+                # Panel is now visible - set stretch factors to show it
+                splitter.setStretchFactor(0, 0)  # Sidebar fixed
+                splitter.setStretchFactor(1, 1)  # Middle expands
+                splitter.setStretchFactor(2, 0)  # AI panel fixed width
+            else:
+                # Panel is hidden - remove it from stretch calculation
+                splitter.setStretchFactor(0, 0)  # Sidebar fixed
+                splitter.setStretchFactor(1, 1)  # Middle expands
+                splitter.setStretchFactor(2, 0)  # AI panel hidden
+
+    def _force_splitter_show_panel(self) -> None:
+        """Force the splitter to allocate space for the AI panel."""
+        if not hasattr(self, '_ai_panel'):
+            return
+
+        # Get the splitter
+        splitter = self._ai_panel.parent()
+        while splitter and not isinstance(splitter, QSplitter):
+            splitter = splitter.parent() if hasattr(splitter, 'parent') else None
+
+        if splitter:
+            # Get current sizes
+            sizes = splitter.sizes()
+            self._append_log(f"Splitter sizes before: {sizes}")
+
+            # Ensure we have 3 widgets
+            if len(sizes) >= 3:
+                total = sum(sizes)
+                # Allocate space: sidebar=200, middle=remaining, panel=300
+                new_sizes = [200, max(100, total - 500), 300]
+                splitter.setSizes(new_sizes)
+                self._append_log(f"Splitter sizes after: {splitter.sizes()}")
+
     def _populate_runs(self, runs: list) -> None:
         self._runs_table.setSortingEnabled(False)
         self._runs_table.setRowCount(len(runs))
@@ -1736,6 +2055,13 @@ class JobPipeMainWindow(QMainWindow):
         
         # Pre-populate the job ID field
         self._resume_job_id_input.setText(str(job_id))
+        
+        # Populate the job details section immediately so user sees info on Resume tab
+        self._update_resume_job_details(str(job_id))
+        
+        # Set flag so that when enrichment polling detects the enriched data,
+        # it auto-stages the resume (see _on_enrichment_detected)
+        self._pending_stage_after_enrichment = True
         
         # DON'T stage immediately - wait for enrichment to complete
         # The staging will happen in _on_enrichment_detected() if flag is set

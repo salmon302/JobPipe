@@ -619,6 +619,80 @@ class JobPipeGuiService:
         return bool(job.description and len(job.description.strip()) > 200)
 
     # -------------------------------------------------------------------------
+    # AI Recommendations
+    # -------------------------------------------------------------------------
+
+    def generate_ai_recommendations(self, top_jobs: list[JobRecord]) -> str:
+        """Generate AI recommendations for job application priorities.
+
+        Uses Gemini API to analyze top-scoring jobs against the Master CV
+        and provide concise application priorities.
+
+        Args:
+            top_jobs: List of top-scoring JobRecord objects (top 20%).
+
+        Returns:
+            AI-generated recommendation text.
+
+        Raises:
+            RuntimeError: If Gemini key is not configured or generation fails.
+        """
+        from jobpipe.resume.gemini_client import (
+            GeminiAPIError,
+            GeminiClient,
+            create_gemini_client_from_settings,
+        )
+
+        # Read Master CV
+        if not self._settings.master_cv_path.exists():
+            raise RuntimeError(f"Master CV not found at: {self._settings.master_cv_path}")
+
+        master_cv = self._settings.master_cv_path.read_text(encoding="utf-8")
+
+        # Build job summaries for the prompt (keep it concise)
+        job_summaries = []
+        for i, job in enumerate(top_jobs[:15], 1):  # Limit to 15 jobs max for prompt size
+            summary = f"""
+Job {i}:
+- Title: {job.title}
+- Company: {job.company}
+- Score: {job.match_score:.3f} (Rel: {job.score_relevance or 'n/a'}, Att: {job.score_attainability or 'n/a'})
+- Description: {job.description[:200]}...""" if job.description else "- Description: N/A"
+            job_summaries.append(summary)
+
+        jobs_text = "\n".join(job_summaries)
+
+        # Build the prompt
+        prompt = f"""You are an expert career advisor and job search strategist.
+
+## Task
+Analyze the following top-scoring jobs (top 20% by match score) against the candidate's Master CV.
+Provide CONCISE, ACTIONABLE application priorities in 200-300 words.
+
+## Guidelines
+- List 3-5 prioritized action items (bullet points)
+- Focus on: which jobs to apply first, why, and any gaps to address
+- Be specific about job titles and companies
+- Consider: match score, skills alignment, experience fit
+- Keep it under 300 words total
+
+## Master CV:
+{master_cv[:2000]}  # Truncate to stay within token limits
+
+## Top Jobs to Prioritize:
+{jobs_text}
+
+## Output Format
+Provide a brief intro (1 sentence), then bullet points with priorities. Be concise and specific."""
+
+        # Create Gemini client and generate text
+        try:
+            client = create_gemini_client_from_settings(self._settings)
+            return client.generate_text(prompt, temperature=0.3, max_output_tokens=1024)
+        except GeminiAPIError as exc:
+            raise RuntimeError(f"AI recommendation failed: {exc}") from exc
+
+    # -------------------------------------------------------------------------
     # AI Resume Generation (direct from GUI)
     # -------------------------------------------------------------------------
     def generate_resume_content(

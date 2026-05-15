@@ -148,6 +148,64 @@ function extractWellFound() {
 }
 
 /**
+ * Extract job data from Indeed
+ * @returns {Object|null} Job data or null if not found
+ */
+function extractIndeed() {
+  try {
+    // Indeed job detail page selectors
+    const titleEl = document.querySelector('h1[data-testid="jobsearch-JobInfoHeader-title"]') ||
+                    document.querySelector('h1.jobsearch-JobInfoHeader-title') ||
+                    document.querySelector('.jobsearch-JobInfoHeader-title') ||
+                    document.querySelector('h1');
+
+    const companyEl = document.querySelector('[data-testid="jobsearch-CompanyInfoContainer"]') ||
+                      document.querySelector('.jobsearch-CompanyInfoContainer') ||
+                      document.querySelector('[data-testid="company-name"]') ||
+                      document.querySelector('a[href*="/cmp/"]');
+
+    const descriptionEl = document.querySelector('#jobDescriptionText') ||
+                          document.querySelector('[data-testid="jobsearch-jobDescriptionText"]') ||
+                          document.querySelector('.jobsearch-jobDescriptionText') ||
+                          document.querySelector('[class*="description"]');
+
+    const locationEl = document.querySelector('[data-testid="jobsearch-JobInfoHeader-location"]') ||
+                       document.querySelector('.jobsearch-JobInfoHeader-location') ||
+                       document.querySelector('[class*="location"]');
+
+    const salaryEl = document.querySelector('[data-testid="jobsearch-CompanyInfoContainer-salary"]') ||
+                     document.querySelector('.jobsearch-salary') ||
+                     document.querySelector('[class*="salary"]');
+
+    if (!titleEl || !descriptionEl) {
+      return null;
+    }
+
+    // Build description with available metadata
+    let fullDescription = descriptionEl.textContent.trim();
+    if (locationEl) {
+      fullDescription = `Location: ${locationEl.textContent.trim()}\n\n${fullDescription}`;
+    }
+    if (salaryEl) {
+      fullDescription = `Salary: ${salaryEl.textContent.trim()}\n\n${fullDescription}`;
+    }
+
+    return {
+      platform: 'Indeed',
+      title: titleEl.textContent.trim(),
+      company: companyEl ? companyEl.textContent.trim() : 'Unknown Company',
+      url: window.location.href,
+      description: fullDescription,
+      location: locationEl ? locationEl.textContent.trim() : null,
+      compensation: salaryEl ? salaryEl.textContent.trim() : null,
+    };
+  } catch (error) {
+    console.error('Error extracting Indeed job:', error);
+    return null;
+  }
+}
+
+/**
  * Auto-detect platform and extract job data
  * @returns {Object|null} Job data or null if extraction fails
  */
@@ -162,6 +220,8 @@ function extractJobData() {
     return extractBuiltIn();
   } else if (hostname.includes('wellfound.com')) {
     return extractWellFound();
+  } else if (hostname.includes('indeed.com')) {
+    return extractIndeed();
   }
 
   // Generic extraction as fallback
@@ -267,6 +327,42 @@ function extractBatchJobs() {
         }
       } catch (error) {
         console.error('Error extracting LinkedIn job card:', error);
+      }
+    });
+  } else if (hostname.includes('indeed.com')) {
+    // Indeed search results page job cards
+    const jobCards = document.querySelectorAll('[data-testid="job-card"]') ||
+                     document.querySelectorAll('.job_seen_beacon') ||
+                     document.querySelectorAll('[class*="jobCard"]');
+
+    jobCards.forEach(card => {
+      try {
+        const titleEl = card.querySelector('[data-testid="job-title"]') ||
+                        card.querySelector('h2 a') ||
+                        card.querySelector('.jobTitle a');
+
+        const companyEl = card.querySelector('[data-testid="company-name"]') ||
+                          card.querySelector('[class*="company"]');
+
+        const linkEl = card.querySelector('a[href*="/viewjob"]') ||
+                       card.querySelector('h2 a') ||
+                       card.querySelector('.jobTitle a');
+
+        if (titleEl && linkEl) {
+          const href = linkEl.href;
+          // Make Indeed URLs absolute
+          const url = href.startsWith('http') ? href : `https://www.indeed.com${href}`;
+
+          jobs.push({
+            platform: 'Indeed',
+            title: titleEl.textContent.trim(),
+            company: companyEl ? companyEl.textContent.trim() : 'Unknown Company',
+            url: url,
+            description: '',
+          });
+        }
+      } catch (error) {
+        console.error('Error extracting Indeed job card:', error);
       }
     });
   }

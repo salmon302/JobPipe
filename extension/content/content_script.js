@@ -1977,7 +1977,9 @@ async function extractBatchJobs() {
       if (nextDataJobs.length > 0) {
         // Find the job matching current URL
         const matchedJob = nextDataJobs.find(j => j.url === window.location.href) || nextDataJobs[0];
-        console.log(`JobPipe: Detail page extracted from __NEXT_DATA__: "${matchedJob.title}" ${matchedJob.description?.length || 0}chars`);
+        // Mark as enriched so background bypasses cache and sends update to server
+        matchedJob.enriched = true;
+        console.log(`JobPipe: Detail page extracted from __NEXT_DATA__: "${matchedJob.title}" ${matchedJob.description?.length || 0}chars (enriched=${matchedJob.enriched})`);
         return [matchedJob];
       }
       
@@ -2570,6 +2572,9 @@ async function attemptAutoScrape() {
       });
       // Track this URL to prevent double-sends
       locallySentUrls.add(currentUrl);
+      
+      // Show an in-page success toast for visible confirmation
+      showInPageToast(`✓ ${sentCount} job${sentCount !== 1 ? 's' : ''} sent to JobPipe${isDetailPage ? ' (enriched)' : ''}!`, 'success');
     } else {
       const displayTitle = jobs[0]?.title || 'Unknown Job';
       updateOverlayStatus('Error ✗', jobs.length, 0, displayTitle);
@@ -2589,6 +2594,72 @@ async function attemptAutoScrape() {
       jobsFound: 0,
       jobsSent: 0
     });
+  }
+}
+
+/**
+ * Show an in-page toast notification for visible confirmation.
+ * Creates a floating banner at the bottom-left that auto-dismisses after 6 seconds.
+ * @param {string} message - The message to display
+ * @param {'success'|'error'|'info'} type - Toast style
+ */
+function showInPageToast(message, type = 'info') {
+  try {
+    // Remove any existing toast
+    const existing = document.getElementById('jobpipe-toast');
+    if (existing) existing.remove();
+
+    const toast = document.createElement('div');
+    toast.id = 'jobpipe-toast';
+    
+    const bgColors = {
+      success: 'linear-gradient(135deg, #059669 0%, #10b981 50%, #34d399 100%)',
+      error: 'linear-gradient(135deg, #dc2626 0%, #ef4444 50%, #f87171 100%)',
+      info: 'linear-gradient(135deg, #2563eb 0%, #3b82f6 50%, #60a5fa 100%)',
+    };
+    
+    toast.style.cssText = `
+      position: fixed;
+      bottom: 24px;
+      left: 24px;
+      background: ${bgColors[type] || bgColors.info};
+      color: white;
+      padding: 14px 22px;
+      border-radius: 10px;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.35);
+      z-index: 2147483647;
+      font-family: 'Segoe UI', Tahoma, sans-serif;
+      font-size: 14px;
+      font-weight: 600;
+      max-width: 420px;
+      pointer-events: none;
+      animation: jobpipeToastIn 0.35s ease-out;
+      transition: opacity 0.4s ease;
+      isolation: isolate;
+    `;
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    
+    // Inject animation keyframes (only once)
+    if (!document.getElementById('jobpipe-toast-style')) {
+      const style = document.createElement('style');
+      style.id = 'jobpipe-toast-style';
+      style.textContent = `
+        @keyframes jobpipeToastIn {
+          from { transform: translateY(30px); opacity: 0; }
+          to { transform: translateY(0); opacity: 1; }
+        }
+      `;
+      document.head.appendChild(style);
+    }
+    
+    // Auto-dismiss after 6 seconds
+    setTimeout(() => {
+      toast.style.opacity = '0';
+      setTimeout(() => toast.remove(), 400);
+    }, 6000);
+  } catch (e) {
+    // Silently fail — toast is cosmetic only
   }
 }
 

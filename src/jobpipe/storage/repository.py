@@ -334,7 +334,7 @@ class JobRepository:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(platform, url) DO UPDATE SET
-                    id = excluded.id,
+
                     title = excluded.title,
                     company = excluded.company,
                     description = excluded.description,

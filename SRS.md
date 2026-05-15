@@ -37,7 +37,7 @@ The system consists of two primary subsystems operating in tandem:
 
 ### 3.1 Data Ingestion (Browser Extension)
 
-* **REQ-1.1:** The extension shall provide a manual trigger (UI button or keyboard shortcut) on supported job boards (e.g., HiringCafe, LinkedIn, Built In).
+* **REQ-1.1:** The extension shall provide a manual trigger (UI button or keyboard shortcut) on supported job boards (e.g., HiringCafe, LinkedIn, Built In, Indeed).
 * **REQ-1.2:** Upon trigger, the extension shall extract the Job Title, Company, URL, and raw Job Description text from the active tab's DOM.
 * **REQ-1.3:** The extension shall transmit the extracted data as a JSON payload to the local GUI application via an HTTP POST request.
 * **REQ-1.4:** The extension shall display a brief visual confirmation (toast notification) upon successful transmission.

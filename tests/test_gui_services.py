@@ -153,6 +153,92 @@ def test_compile_resume_delegates_with_config(monkeypatch, tmp_path) -> None:
     assert captured["config"].pdflatex_command == service.settings.resume_pdflatex_command
 
 
+def test_generate_ai_recommendations_success(monkeypatch, tmp_path) -> None:
+    """Test successful AI recommendation generation."""
+    # Create a fake Master CV
+    master_cv_path = tmp_path / "Master_CV.md"
+    master_cv_path.write_text("# John Doe\n## Skills\nPython, SQL\n## Experience\n3 years", encoding="utf-8")
+    
+    monkeypatch.setenv("JOBPIPE_MASTER_CV_PATH", str(master_cv_path))
+    monkeypatch.setenv("JOBPIPE_GEMINI_API_KEY", "fake-api-key")
+    monkeypatch.setenv("JOBPIPE_GEMINI_MODEL", "gemini-flash-latest")
+    
+    # Create fake top jobs
+    from jobpipe.storage.models import JobRecord
+    from datetime import datetime, timezone
+    
+    top_jobs = [
+        JobRecord(
+            id="job-1",
+            platform="HiringCafe",
+            title="Python Developer",
+            company="Tech Corp",
+            url="https://example.com/job1",
+            description="Looking for Python developer with SQL skills",
+            match_score=0.95,
+            score_relevance=0.90,
+            score_attainability=0.95,
+            date_posted=datetime(2026, 5, 10, 12, 0, tzinfo=timezone.utc),
+        ),
+        JobRecord(
+            id="job-2",
+            platform="HiringCafe",
+            title="Backend Engineer",
+            company="Data Inc",
+            url="https://example.com/job2",
+            description="Backend work with Python and databases",
+            match_score=0.88,
+            score_relevance=0.85,
+            score_attainability=0.90,
+            date_posted=datetime(2026, 5, 11, 12, 0, tzinfo=timezone.utc),
+        ),
+    ]
+    
+    # Mock the Gemini client - need to mock where it's imported in the method
+    def _fake_create_gemini_client(settings):
+        class FakeClient:
+            def generate_text(self, prompt, temperature=0.3, max_output_tokens=1024):
+                return "1. Apply to Python Developer at Tech Corp first (score 0.95)\n2. Consider Backend Engineer at Data Inc (score 0.88)"
+        return FakeClient()
+    
+    monkeypatch.setattr("jobpipe.resume.gemini_client.create_gemini_client_from_settings", _fake_create_gemini_client)
+    
+    service = JobPipeGuiService(_settings(tmp_path, monkeypatch))
+    result = service.generate_ai_recommendations(top_jobs)
+    
+    assert "Python Developer" in result
+    assert "Tech Corp" in result
+    assert "Backend Engineer" in result
+
+
+def test_generate_ai_recommendations_no_api_key(monkeypatch, tmp_path) -> None:
+    """Test that missing API key raises RuntimeError."""
+    # Create a fake Master CV so it passes that check
+    master_cv_path = tmp_path / "Master_CV.md"
+    master_cv_path.write_text("# John Doe\n## Skills\nPython", encoding="utf-8")
+    
+    monkeypatch.setenv("JOBPIPE_MASTER_CV_PATH", str(master_cv_path))
+    monkeypatch.setenv("JOBPIPE_GEMINI_API_KEY", "")  # Empty API key
+    
+    service = JobPipeGuiService(_settings(tmp_path, monkeypatch))
+    top_jobs = []  # Empty list, should fail at API key check
+    
+    with pytest.raises(RuntimeError, match="Gemini API key not configured"):
+        service.generate_ai_recommendations(top_jobs)
+
+
+def test_generate_ai_recommendations_missing_cv(monkeypatch, tmp_path) -> None:
+    """Test that missing Master CV raises RuntimeError."""
+    monkeypatch.setenv("JOBPIPE_GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv("JOBPIPE_MASTER_CV_PATH", str(tmp_path / "non_existent.md"))
+    
+    service = JobPipeGuiService(_settings(tmp_path, monkeypatch))
+    top_jobs = []
+    
+    with pytest.raises(RuntimeError, match="Master CV not found"):
+        service.generate_ai_recommendations(top_jobs)
+
+
 def test_list_jobs_searches_and_returns_unscored_rows(monkeypatch, tmp_path) -> None:
     service = JobPipeGuiService(_settings(tmp_path, monkeypatch))
     initialize_database(service.settings.db_path)
