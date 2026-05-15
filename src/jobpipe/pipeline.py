@@ -178,29 +178,23 @@ def score_pending_jobs(
         years_required = extract_years_required(job.description)
         is_remote = bool(infer_remote(f"{job.title} {job.description}"))
 
-        if should_discard_for_senior_role(
-            required_years=years_required,
-            user_years_experience=settings.user_years_experience,
-        ):
-            LOGGER.info(
-                "Job rejected: senior role requires %s years, user has %s",
-                years_required,
-                settings.user_years_experience,
-            )
-            updates.append(
-                (
-                    0.0,
-                    years_required,
-                    is_remote,
-                    "Rejected",
-                    0.0,
-                    0.0,
-                    0.0,
-                    job.id,
-                )
+        # ---- Early recency filter: reject old jobs immediately ----
+        rec = recency_score(job.date_posted, is_remote)
+        if rec < 0.1:  # Skip jobs older than ~7 days
+            repository.update_scoring(
+                job.id,
+                0.0,  # total
+                0.0,  # relevance
+                0.0,  # attainability
+                0.0,  # recency
+                "Rejected",
             )
             scored += 1
             continue
+
+        # Experience-based filtering removed - users filter by years in UI
+        # The attainability score already penalizes experience mismatches
+        # without hard-rejecting jobs that users might want to see
 
         to_score_jobs.append(job)
         to_score_meta.append((job, years_required, is_remote))
@@ -261,12 +255,17 @@ def score_pending_jobs(
             # Domain alignment
             dom_score, dom_detail = domain_alignment_score(job.title, job.description, parsed_cv) if parsed_cv else (0.5, "no_cv")
 
-            # Blend into final relevance
+            # Boost relevance for strong keyword/domain matches
             blended_relevance, rel_detail = compute_blended_relevance(
                 embedding_score=section_emb_score,
                 keyword_score=kw_score,
                 domain_score=dom_score,
             )
+            
+            # Apply relevance boost: if keyword + domain both strong, boost by 10%
+            if kw_score > 0.6 and dom_score > 0.8:
+                blended_relevance = min(1.0, blended_relevance * 1.1)
+                rel_detail += " [boosted]"
 
             # ---- Attainability ----
             att_score, att_detail = attainability_score(
@@ -277,9 +276,14 @@ def score_pending_jobs(
                 job_title=job.title,
                 is_remote_job=is_remote,
             )
+            
+            # Penalize attainability for domain mismatches
+            if dom_score < 0.3:  # Complete domain mismatch
+                att_score = att_score * 0.7  # Additional 30% penalty
+                att_detail += " [domain_penalty]"
 
-            # ---- Recency ----
-            rec = recency_score(job.date_posted, is_remote)
+            # ---- Recency (recomputed above) ----
+            # rec is already computed above
 
             # ---- Dynamic weights by job type ----
             job_type = _detect_job_type(job.title, job.description)

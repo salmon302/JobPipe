@@ -217,6 +217,7 @@ _DOMAIN_KEYWORDS: dict[str, list[str]] = {
     "data_science": ["NLP", "machine learning", "data analysis", "predictive", "statistical", "OCR", "dataset"],
     "embedded": ["embedded", "MCU", "microcontroller", "AVR", "Arduino", "ESP32", "firmware", "sensor"],
     "audio": ["audio", "DSP", "signal", "synthesis", "SuperCollider", "sound"],
+    "government": ["government", "legislative", "congress", "public sector", "federal", "state", "municipal", "policy", "agency"],
 }
 
 # Education level detection
@@ -271,6 +272,36 @@ def _parse_skills(text: str) -> CategorizedSkills:
     """Parse skills section into categorized structure."""
     skills = CategorizedSkills()
     if not text:
+        return skills
+
+    # Try LaTeX textbf format: \textbf{Category:} items
+    latex_matches = list(re.finditer(r"\\textbf\{([^}]+)\}(.*?)(?=\\textbf\{|\\section|\\vspace|\\noindent|\\end\{document\}|$)", text, re.DOTALL))
+    if latex_matches:
+        for match in latex_matches:
+            cat_name = match.group(1).strip()
+            # Clean up category name (remove \&, LaTeX commands)
+            cat_name = re.sub(r"\\&\s*", " and ", cat_name)
+            items_text = match.group(2).strip()
+            # Clean up LaTeX formatting
+            items_text = re.sub(r"\\href\{.+?\}\{(.+?)\}", r"\1", items_text)
+            items_text = re.sub(r"\\vspace\{.+?\}", "", items_text)
+            items_text = re.sub(r"\\noindent\s*", "", items_text)
+            # Handle escaped characters (C\#, C\+\+)
+            items_text = items_text.replace("\\#", "#").replace("\\+", "+")
+            # Split by comma, semicolon, or newline
+            items = [s.strip() for s in re.split(r"[,;\n]", items_text) if s.strip()]
+            cat_lower = cat_name.lower()
+            if "language" in cat_lower:
+                skills.languages.extend(items)
+            elif "framework" in cat_lower or "library" in cat_lower:
+                skills.frameworks.extend(items)
+            elif "infrastructure" in cat_lower or "tool" in cat_lower:
+                skills.infrastructure.extend(items)
+            elif "domain" in cat_lower or "expertise" in cat_lower:
+                skills.domains.extend(items)
+            else:
+                # Fallback: try to categorize by content
+                skills.domains.extend(items)
         return skills
 
     # Try Markdown bold-category format: **Category:** items

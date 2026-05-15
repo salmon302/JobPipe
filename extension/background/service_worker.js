@@ -163,6 +163,39 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ success: true });
     return false;
   }
+
+  if (request.action === 'CREATE_DEV_NOTE') {
+    // Save automated dev note to SNDEV/docs/
+    try {
+      const hostname = request.hostname.replace(/[^a-zA-Z0-9]/g, '-');
+      const filename = `SNDEV/docs/auto-dev-note-${hostname}-${Date.now()}.md`;
+      
+      // Use chrome.downloads to save the file (if permissions allow)
+      const blob = new Blob([request.content], { type: 'text/markdown' });
+      const url = URL.createObjectURL(blob);
+      
+      chrome.downloads.download({
+        url: url,
+        filename: filename,
+        saveAs: false,
+      }, (downloadId) => {
+        if (chrome.runtime.lastError) {
+          console.log('JobPipe: Could not save dev note via downloads:', chrome.runtime.lastError.message);
+          // Fallback: just log to console
+          console.log('JobPipe: Dev note content for manual save:', request.content);
+        } else {
+          console.log('JobPipe: Dev note saved to', filename, 'downloadId:', downloadId);
+        }
+        URL.revokeObjectURL(url);
+      });
+      
+      sendResponse({ success: true, filename: filename });
+    } catch (error) {
+      console.error('Error saving dev note:', error);
+      sendResponse({ success: false, error: error.message });
+    }
+    return true;
+  }
 });
 
 /**
@@ -297,28 +330,32 @@ async function handleSendBatchToServer(jobs, serverUrl, sendResponse) {
     }
 
     const payload = {
-      jobs: uniqueJobs.map(job => ({
-        platform: job.platform,
-        id: job.id || null,
-        title: job.title,
-        company: job.company,
-        url: job.url,
-        description: job.description || '',
-        summary: job.summary || null,
-        requirements: job.requirements || null,
-        location: job.location || null,
-        county: job.county || null,
-        compensation: job.compensation || null,
-        workplace_type: job.workplace_type || null,
-        employment_type: job.employment_type || null,
-        department: job.department || null,
-        team: job.team || null,
-        views: job.views ?? null,
-        saves: job.saves ?? null,
-        applications: job.applications ?? null,
-        posted_at: job.posted_at || null,
-        posted_ago: job.posted_ago || null,
-      })),
+      jobs: uniqueJobs.map(job => {
+        // Normalize URL by stripping query parameters for proper DB matching
+        const normalizedUrl = (job.url || '').split('?')[0].split('#')[0];
+        return {
+          platform: job.platform,
+          id: job.id || null,
+          title: job.title,
+          company: job.company,
+          url: normalizedUrl,  // Use normalized URL for DB matching
+          description: job.description || '',
+          summary: job.summary || null,
+          requirements: job.requirements || null,
+          location: job.location || null,
+          county: job.county || null,
+          compensation: job.compensation || null,
+          workplace_type: job.workplace_type || null,
+          employment_type: job.employment_type || null,
+          department: job.department || null,
+          team: job.team || null,
+          views: job.views ?? null,
+          saves: job.saves ?? null,
+          applications: job.applications ?? null,
+          posted_at: job.posted_at || null,
+          posted_ago: job.posted_ago || null,
+        };
+      }),
     };
 
     console.log('JobPipe: Sending payload with', payload.jobs.length, 'jobs to', serverUrl);
@@ -401,12 +438,15 @@ async function handleSendEnrichedToServer(jobData, serverUrl, sendResponse) {
 
     console.log('JobPipe: Sending enriched data for', jobId || url);
 
+    // Normalize URL by stripping query parameters for proper DB matching
+    const normalizedUrl = (url || '').split('?')[0].split('#')[0];
+
     const payload = {
       platform: platform,
       id: jobId || null,
       title: jobData.title,
       company: jobData.company,
-      url: url,
+      url: normalizedUrl,  // Use normalized URL for DB matching
       description: jobData.description || '',
       summary: jobData.summary || null,
       requirements: jobData.requirements || null,
@@ -421,11 +461,12 @@ async function handleSendEnrichedToServer(jobData, serverUrl, sendResponse) {
       posted_ago: jobData.posted_ago || null,
     };
 
+    console.log('JobPipe: Enriched payload - platform:', platform, 'jobId:', jobId, 'company:', jobData.company, 'descLength:', (jobData.description || '').length);
+
+    // Actually send the enriched data to the server!
     const response = await fetch(`${serverUrl}/ingest`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
       mode: 'cors',
     });
@@ -437,14 +478,15 @@ async function handleSendEnrichedToServer(jobData, serverUrl, sendResponse) {
 
     const result = await response.json();
 
-    // Add to cache to prevent duplicate sends
-    if (jobId) {
-      sentJobsCache.add(`${platform}:${jobId}`);
-    } else {
-      sentJobsCache.add(`${platform}:${url}`);
+    // Log confirmation: show inserted/updated counts
+    console.log('JobPipe: Enriched data sent successfully');
+    console.log('JobPipe: Server response - inserted:', result.inserted, 'updated:', result.updated, 'run_id:', result.run_id);
+    if (result.updated > 0) {
+      console.log(`JobPipe: ✅ Enriched data updated existing job "${jobData.title}" in database`);
+    } else if (result.inserted > 0) {
+      console.log(`JobPipe: ✅ Enriched data inserted as new job "${jobData.title}" in database`);
     }
 
-    console.log('JobPipe: Enriched data sent successfully');
     showToastNotification(`✓ Enriched "${jobData.title}" with full description!`);
 
     // Broadcast status update to popup
@@ -499,3 +541,6 @@ setInterval(() => {
     console.log('Cleared sent jobs cache (size threshold reached)');
   }
 }, 60 * 60 * 1000);
+
+// Extension loaded successfully
+console.log('JobPipe: Background service worker loaded successfully');

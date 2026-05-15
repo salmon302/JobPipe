@@ -64,6 +64,11 @@ _JOB_DOMAIN_KEYWORDS: dict[str, list[str]] = {
         "Docker", "Kubernetes", "Terraform", "Ansible",
         "CI/CD", "deployment", "monitoring",
     ],
+    "government": [
+        "government", "legislative", "congress", "senate", "house of representatives",
+        "political", "public sector", "federal", "state", "municipal",
+        "policy", "regulatory", "agency", "department", "bureau",
+    ],
 }
 
 
@@ -108,8 +113,15 @@ def domain_alignment_score(
         return 0.5, "No domain detected for job"
 
     cv_domains = cv.experience_domains()
+    
+    # If CV has no experience domains, check if the job domain is in CV skills/projects
     if not cv_domains:
-        return 0.5, f"Job domain: {job_domain}, no CV experience domains"
+        # Check if any CV skills or project domains match the job domain
+        cv_all_text = cv.raw_text.lower()
+        if job_domain in cv_all_text:
+            return 0.75, f"Job domain '{job_domain}' found in CV text (no experience entries)"
+        # No CV domains and job domain not in CV - penalize
+        return 0.3, f"Job domain: {job_domain}, no CV experience domains (penalty)"
 
     # Check if job domain matches any CV experience domain
     if job_domain in cv_domains:
@@ -131,10 +143,13 @@ def domain_alignment_score(
         ("enterprise", "frontend"),
         ("devops", "enterprise"),
         ("enterprise", "devops"),
+        ("government", "enterprise"),     # government uses enterprise tech
+        ("enterprise", "government"),
     ]
 
     for d1, d2 in related_pairs:
         if job_domain == d1 and d2 in cv_domains:
             return 0.75, f"Related domain: {job_domain} (CV has {d2})"
 
-    return 0.3, f"Domain mismatch: job={job_domain}, CV has {', '.join(cv_domains)}"
+    # Complete mismatch - strong penalty
+    return 0.2, f"Domain mismatch: job={job_domain}, CV has {', '.join(cv_domains)}"

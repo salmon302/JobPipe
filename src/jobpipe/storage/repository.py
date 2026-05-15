@@ -243,25 +243,36 @@ class JobRepository:
 
             # URL-based dedup: check if any incoming job's URL already exists
             # under a different ID (e.g., same job ingested from different platforms).
-            # When found, rewrite the incoming job's ID to match the existing record
-            # so ON CONFLICT(id) merges the data instead of inserting a duplicate.
-            incoming_urls = [(job.url, job.id) for job in jobs]
-            url_placeholders = ",".join("?" for _ in incoming_urls)
-            if incoming_urls:
-                # Build a mapping of URL -> existing ID
+            # Normalize URLs by stripping query parameters so enriched pages (different query strings)
+            # still match the original job record.
+            def _normalize_url(url: str) -> str:
+                """Strip query parameters and fragments for URL comparison."""
+                return url.split("?")[0].split("#")[0]
+
+            incoming_norm_urls = [_normalize_url(job.url) for job in jobs]
+            url_placeholders = ",".join("?" for _ in incoming_norm_urls)
+            if incoming_norm_urls:
+                # Build a mapping of normalized URL -> existing ID
                 url_to_existing_id: dict[str, str] = {}
-                for chunk_urls in [incoming_urls[i:i+900] for i in range(0, len(incoming_urls), 900)]:
-                    chunk_placeholders = ",".join("?" for _ in chunk_urls)
+                for chunk_norm_urls in [
+                    incoming_norm_urls[i:i+900] for i in range(0, len(incoming_norm_urls), 900)
+                ]:
+                    chunk_placeholders = ",".join("?" for _ in chunk_norm_urls)
                     url_rows = conn.execute(
                         f"SELECT id, url FROM jobs WHERE url IN ({chunk_placeholders})",
-                        [u[0] for u in chunk_urls],
+                        chunk_norm_urls,
                     ).fetchall()
                     for row in url_rows:
-                        url_to_existing_id[row["url"]] = row["id"]
+                        norm_existing = _normalize_url(row["url"])
+                        for u in chunk_norm_urls:
+                            if u == norm_existing:
+                                url_to_existing_id[u] = row["id"]
+                                break
 
-                # Rewrite IDs for jobs whose URL already exists under a different ID
+                # Rewrite IDs for jobs whose normalized URL already exists under a different ID
                 for job in jobs:
-                    existing_id = url_to_existing_id.get(job.url)
+                    norm_url = _normalize_url(job.url)
+                    existing_id = url_to_existing_id.get(norm_url)
                     if existing_id is not None and existing_id != job.id:
                         LOGGER.info(
                             "upsert_jobs | URL dedup: %s -> %s (was %s)",
@@ -322,13 +333,13 @@ class JobRepository:
                     posted_ago
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    platform = excluded.platform,
+                ON CONFLICT(platform, url) DO UPDATE SET
+                    id = excluded.id,
                     title = excluded.title,
                     company = excluded.company,
-                    url = excluded.url,
                     description = excluded.description,
                     date_posted = excluded.date_posted,
+                    status = excluded.status,
                     summary = excluded.summary,
                     requirements = excluded.requirements,
                     location = excluded.location,

@@ -42,7 +42,20 @@ def build_keyword_lexicon(cv: ParsedCV) -> dict[str, float]:
             term = term.strip().lower()
             if term and len(term) > 2:
                 lexicon[term] = TIER_3_WEIGHT
-
+    # Add domain expertise terms from CV text (e.g., "Real-Time Engines", "FDA/cGMP")
+    # These are important ATS keywords that should be in the lexicon
+    domain_expertise_terms = [
+        "real-time", "real time", "engine", "simulation", "visualization",
+        "quality assurance", "qa", "fda", "cgmp", "gmp", "regulatory", "compliance",
+        "data integrity", "traceability", "audit", "sop",
+        "machine learning", "ml", "deep learning", "neural network",
+        "embedded", "microcontroller", "mcu", "esp32", "arduino",
+        "audio", "dsp", "signal processing", "synthesis",
+        "cloud", "aws", "azure", "gcp", "infrastructure",
+    ]
+    for term in domain_expertise_terms:
+        if term not in lexicon:
+            lexicon[term] = TIER_3_WEIGHT
     # Add tech stacks from experience and projects as Tier 2
     for tech in cv.all_tech_stacks():
         if tech not in lexicon:

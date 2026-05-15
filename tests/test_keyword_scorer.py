@@ -43,7 +43,9 @@ def test_keyword_density_full_match() -> None:
 
     text = "We use C++, Python, JavaScript, React, FastAPI, Qt, Docker, AWS, and Git."
     score, details = keyword_density_score(text, lexicon)
-    assert score > 0.5  # Should be high for near-full match
+    # With domain expertise terms added, the lexicon is larger, so score is lower
+    # but should still be reasonable for a good match
+    assert score > 0.3  # Adjusted threshold for expanded lexicon
     # Note: C++ doesn't match \b boundary; other keywords do
     assert "python" in details.lower()
 

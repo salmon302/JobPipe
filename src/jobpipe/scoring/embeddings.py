@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import importlib
+import logging
+import os
 import threading
 from typing import Sequence
 
 import numpy as np
 
+# Force offline mode to prevent any HuggingFace Hub API calls
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+LOGGER = logging.getLogger(__name__)
 
 _MODEL_CACHE: dict[str, object] = {}
 _MODEL_LOCK = threading.Lock()
@@ -33,7 +40,20 @@ class LocalEmbedder:
                         "Install dependencies before running scoring."
                     ) from exc
 
-                cached = sentence_transformer(self._model_name)
+                # Load from local cache to avoid HuggingFace API checks
+                cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+                try:
+                    cached = sentence_transformer(
+                        self._model_name,
+                        cache_folder=cache_dir,
+                        local_files_only=True,
+                    )
+                    LOGGER.info("Embedding model loaded from cache: %s", cache_dir)
+                except Exception as exc:
+                    LOGGER.warning("Failed to load from cache, trying without cache: %s", exc)
+                    cached = sentence_transformer(self._model_name)
+                    LOGGER.info("Embedding model loaded without cache")
+
                 _MODEL_CACHE[self._model_name] = cached
 
         self._model = cached

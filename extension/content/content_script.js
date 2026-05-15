@@ -42,6 +42,64 @@ function safeSendMessage(message, callback) {
   }
 }
 
+// ==================== EXCLUDED HOSTNAMES (Not Job Board) ====================
+
+/**
+ * Get the set of excluded hostnames from storage
+ * @returns {Promise<Set>} Set of excluded hostnames
+ */
+async function getExcludedHosts() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(['excludedHosts'], (result) => {
+      const hosts = result.excludedHosts || [];
+      resolve(new Set(hosts));
+    });
+  });
+}
+
+/**
+ * Check if current hostname is excluded
+ * @returns {Promise<boolean>} True if excluded
+ */
+async function isCurrentSiteExcluded() {
+  const hostname = window.location.hostname.toLowerCase();
+  const excludedHosts = await getExcludedHosts();
+  return excludedHosts.has(hostname);
+}
+
+/**
+ * Add current hostname to excluded list
+ * @returns {Promise<void>}
+ */
+async function excludeCurrentSite() {
+  const hostname = window.location.hostname.toLowerCase();
+  return new Promise((resolve) => {
+    chrome.storage.local.get(['excludedHosts'], (result) => {
+      const hosts = result.excludedHosts || [];
+      if (!hosts.includes(hostname)) {
+        hosts.push(hostname);
+        chrome.storage.local.set({ excludedHosts: hosts }, resolve);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+/**
+ * Remove current hostname from excluded list
+ * @returns {Promise<void>}
+ */
+async function includeCurrentSite() {
+  const hostname = window.location.hostname.toLowerCase();
+  return new Promise((resolve) => {
+    chrome.storage.local.get(['excludedHosts'], (result) => {
+      const hosts = (result.excludedHosts || []).filter(h => h !== hostname);
+      chrome.storage.local.set({ excludedHosts: hosts }, resolve);
+    });
+  });
+}
+
 // ==================== EXTRACTOR FUNCTIONS (inlined for Manifest V3) ====================
 
 /**
@@ -299,15 +357,20 @@ function extractUKG() {
 }
 
 /**
- * Generic job extraction fallback
+ * Generic job extraction fallback - improved with multiple strategies
+ * Attempts to extract job data from any job page, even without specialized extractor.
+ * Also creates automated dev notes for unknown platforms for further investigation.
  */
 function extractGeneric() {
   try {
     // Try multiple strategies to find the job title
     let title = null;
     let company = 'Unknown Company';
+    let description = '';
 
-    // Strategy 1: Look for job title in common patterns
+    // === TITLE EXTRACTION ===
+    
+    // Strategy 1: Look for job title in common DOM patterns
     const titleSelectors = [
       'h1[class*="title"]',
       'h1[class*="job"]',
@@ -317,7 +380,9 @@ function extractGeneric() {
       'h1',
       '.title',
       '[class*="header"] h1',
-      'header h1'
+      'header h1',
+      '[class*="position"]',
+      '[class*="role"]',
     ];
 
     for (const selector of titleSelectors) {
@@ -330,7 +395,7 @@ function extractGeneric() {
             !text.toLowerCase().includes('login') &&
             !text.toLowerCase().includes('sign in') &&
             text.length > 3 && 
-            text.length < 200) {
+            text.length < 300) {
           title = text;
           break;
         }
@@ -343,7 +408,7 @@ function extractGeneric() {
       const titleParts = document.title.split(/[|\-–—]/);
       if (titleParts.length > 0) {
         const candidate = titleParts[0].trim();
-        if (candidate.length > 3 && candidate.length < 200) {
+        if (candidate.length > 3 && candidate.length < 300) {
           title = candidate;
         }
       }
@@ -359,6 +424,25 @@ function extractGeneric() {
       }
     }
 
+    // Strategy 4: Look for text near "Apply" or "Apply Now" buttons
+    if (!title) {
+      const applyButtons = document.querySelectorAll('a, button');
+      for (const btn of applyButtons) {
+        const btnText = btn.textContent.toLowerCase();
+        if (btnText.includes('apply') && btnText.length < 50) {
+          // Look for nearby heading
+          const parent = btn.closest('section, article, div[class]');
+          const heading = parent?.querySelector('h1, h2, h3');
+          if (heading) {
+            title = heading.textContent.trim();
+            break;
+          }
+        }
+      }
+    }
+
+    // === COMPANY EXTRACTION ===
+    
     // Strategy 1: Look for company name — EXCLUDE nav/header/breadcrumb elements
     const companySelectors = [
       '[itemprop="hiringOrganization"]',
@@ -368,12 +452,14 @@ function extractGeneric() {
       '[class*="company"]:not(nav *):not(header *):not([class*="breadcrumb"]):not([class*="nav"])',
       '[class*="employer"]:not(nav *):not(header *)',
       'a[href*="/company"]:not(nav *)',
+      '[class*="organization"]',
+      'meta[property="og:site_name"]',
     ];
     
     for (const selector of companySelectors) {
       const el = document.querySelector(selector);
       if (el) { 
-        const text = el.textContent.trim();
+        const text = el.getAttribute('content') || el.textContent.trim();
         if (text && text.length > 1 && text.length < 100 &&
             !text.toLowerCase().includes('sign in') &&
             !text.toLowerCase().includes('login') &&
@@ -411,25 +497,260 @@ function extractGeneric() {
       }
     }
 
-    const descriptionEl = document.querySelector('[class*="description"]') ||
-                          document.querySelector('[class*="content"]') ||
-                          document.querySelector('article') ||
-                          document.querySelector('main');
+    // Strategy 4: Extract company from description text
+    if (company === 'Unknown Company') {
+      const pageText = document.body?.textContent || '';
+      const companyFromDesc = extractCompanyFromDescription(pageText);
+      if (companyFromDesc) {
+        company = companyFromDesc;
+      }
+    }
 
-    if (!title || !descriptionEl) {
-      console.log('JobPipe: Generic extraction failed - title:', title, 'description:', !!descriptionEl);
+    // === DESCRIPTION EXTRACTION ===
+    
+    // Try multiple selectors for description
+    const descriptionSelectors = [
+      '[class*="description"]',
+      '[class*="content"]',
+      '[class*="detail"]',
+      '[class*="body"]',
+      'article',
+      'main',
+      '[role="main"]',
+      '[class*="posting"]',
+      '[class*="job-detail"]',
+      '[class*="job-content"]',
+    ];
+    
+    let descriptionEl = null;
+    for (const sel of descriptionSelectors) {
+      const el = document.querySelector(sel);
+      if (el && el.textContent.trim().length > 100) {
+        descriptionEl = el;
+        break;
+      }
+    }
+    
+    // Fallback: use body text if no description found
+    if (!descriptionEl) {
+      description = document.body?.textContent?.trim() || '';
+    } else {
+      description = descriptionEl.textContent.trim();
+    }
+
+    if (!title || description.length < 100) {
+      console.log('JobPipe: Generic extraction failed - title:', title, 'descLength:', description.length);
+      
+      // Create automated dev note for unknown platform
+      createAutomatedDevNote(title, company, description.length);
+      
       return null;
     }
+
+    // Create automated dev note for investigation (even on success)
+    createAutomatedDevNote(title, company, description.length);
 
     return {
       platform: 'Generic',
       title: title,
       company: company,
       url: window.location.href,
-      description: descriptionEl.textContent.trim(),
+      description: description,
     };
   } catch (error) {
     console.error('Error in generic extraction:', error);
+    return null;
+  }
+}
+
+/**
+ * Create automated dev note for unknown platforms
+ * Saves investigation notes to SNDEV/docs/ for later analysis
+ */
+function createAutomatedDevNote(title, company, descLength) {
+  try {
+    const hostname = window.location.hostname;
+    const pathname = window.location.pathname;
+    const url = window.location.href;
+    
+    // Only create note if we have basic info
+    if (!title || title === 'Unknown Title') return;
+    
+    const noteContent = `Title: Auto-generated Dev Note - ${hostname}
+Date: ${new Date().toISOString()}
+Author: JobPipe Auto-Scraper (Tencent: Hy3 preview Agent)
+Contribution Type: Implementation
+Ticket/Context: Automated detection of unknown platform
+Summary: Generic extractor used on ${hostname} - needs investigation for specialized extractor.
+
+## Platform Details
+- **Hostname**: ${hostname}
+- **Path**: ${pathname}
+- **Full URL**: ${url}
+
+## Extracted Data
+- **Title**: ${title}
+- **Company**: ${company}
+- **Description Length**: ${descLength} characters
+
+## Investigation Needed
+- [ ] Analyze page structure (F12 -> Elements)
+- [ ] Identify unique CSS selectors for title, company, description
+- [ ] Create specialized extractor function
+- [ ] Add platform detection to extractJobData()
+- [ ] Test with sample job URL
+
+## Page Structure Notes
+<!-- Add notes about unique DOM structure here after investigation -->
+`;
+
+    console.log('JobPipe: Auto-dev-note created for', hostname);
+    console.log('JobPipe: Dev note content (copy to SNDEV/docs/):', noteContent);
+    
+    // Send to background script to save (if possible)
+    safeSendMessage({
+      action: 'CREATE_DEV_NOTE',
+      hostname: hostname,
+      content: noteContent,
+    }).catch(() => {
+      // Background may not be ready, just log to console
+      console.log('JobPipe: Could not send dev note to background');
+    });
+  } catch (error) {
+    console.error('Error creating automated dev note:', error);
+  }
+}
+
+/**
+ * Extract job data from Greenhouse job boards (e.g., job-boards.greenhouse.io/companyname/jobs/ID)
+ */
+function extractGreenhouseBoard() {
+  try {
+    // Extract company from URL path: /companyname/jobs/ID
+    const urlPath = window.location.pathname;
+    const match = urlPath.match(/^\/([^/]+)\/jobs?\//i);
+    let company = 'Unknown';
+    if (match && match[1]) {
+      // Convert "technergetics" to "Technergetics"
+      company = match[1]
+        .split(/[-_]/)
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(' ');
+    }
+    
+    // Try to get better title from page
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('title');
+    const title = titleEl ? titleEl.textContent.trim() : document.title;
+    
+    // Get description
+    const descriptionEl = document.querySelector('[class*="description"]') ||
+                          document.querySelector('[class*="content"]') ||
+                          document.querySelector('article') ||
+                          document.querySelector('main');
+    
+    if (!descriptionEl) {
+      console.log('JobPipe: Greenhouse board - no description found');
+      return null;
+    }
+    
+    console.log(`JobPipe: Greenhouse board extracted - company: ${company}, title: ${title}`);
+    
+    // Generate a stable job ID from URL for matching
+    const urlHash = window.location.href.split('?')[0].replace(/[^a-zA-Z0-9]/g, '_').substring(0, 64);
+    const jobId = `greenhouse-${urlHash}`;
+    
+    console.log(`JobPipe: Greenhouse board - generated job ID: ${jobId}`);
+    
+    return {
+      id: jobId,
+      platform: 'greenhouse',
+      title: title,
+      company: company,
+      url: window.location.href,
+      description: descriptionEl.textContent.trim(),
+    };
+  } catch (error) {
+    console.error('Error in Greenhouse board extraction:', error);
+    return null;
+  }
+}
+
+/**
+ * Extract job data from iCIMS job boards (e.g., careers-company.icims.com/jobs/ID)
+ */
+function extractICIMS() {
+  try {
+    const hostname = window.location.hostname.toLowerCase();
+    
+    // Extract company from subdomain: careers-dminc.icims.com -> DMI
+    let company = 'Unknown';
+    const subdomainMatch = hostname.match(/^careers-([^.]+)\.icims\.com/);
+    if (subdomainMatch && subdomainMatch[1]) {
+      company = subdomainMatch[1]
+        .split(/[-_]/)
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(' ');
+    }
+    
+    // Extract job ID from path: /jobs/28734/...
+    const pathMatch = window.location.pathname.match(/\/jobs?\/(\d+)/i);
+    const jobNumber = pathMatch ? pathMatch[1] : 'unknown';
+    
+    // Try to get title
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('[class*="job-title"]') ||
+                    document.querySelector('[class*="JobTitle"]') ||
+                    document.querySelector('title');
+    const title = titleEl ? titleEl.textContent.trim() : document.title;
+    
+    // Try to get description - iCIMS often uses specific class patterns
+    const descriptionEl = document.querySelector('[class*="description"]') ||
+                          document.querySelector('[class*="Description"]') ||
+                          document.querySelector('[class*="content"]') ||
+                          document.querySelector('[class*="Content"]') ||
+                          document.querySelector('[class*="job-body"]') ||
+                          document.querySelector('[class*="JobBody"]') ||
+                          document.querySelector('article') ||
+                          document.querySelector('main') ||
+                          document.querySelector('.iCIMS_JobHeaderGroup') ||
+                          document.querySelector('.iCIMS_JobsTable');
+    
+    if (!descriptionEl) {
+      console.log('JobPipe: iCIMS - no description element found, using generic extraction');
+      // Fall back to generic extraction for the body text
+      const bodyText = document.body ? document.body.innerText.trim() : '';
+      if (bodyText && bodyText.length > 100) {
+        const jobId = `icims-${jobNumber}-${company.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase()}`;
+        return {
+          id: jobId,
+          platform: 'icims',
+          title: title,
+          company: company,
+          url: window.location.href.split('?')[0],
+          description: bodyText.substring(0, 10000),
+        };
+      }
+      return null;
+    }
+    
+    console.log(`JobPipe: iCIMS extracted - company: ${company}, title: ${title}`);
+    
+    // Generate stable job ID from job number and company
+    const jobId = `icims-${jobNumber}-${company.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase()}`;
+    
+    return {
+      id: jobId,
+      platform: 'icims',
+      title: title,
+      company: company,
+      url: window.location.href.split('?')[0],
+      description: descriptionEl.textContent.trim(),
+    };
+  } catch (error) {
+    console.error('Error in iCIMS extraction:', error);
     return null;
   }
 }
@@ -459,9 +780,76 @@ function extractJobData() {
     return extractOasisRecruit();
   }
 
+  // Check for iCIMS platform (careers-company.icims.com)
+  if (hostname.includes('icims.com')) {
+    console.log('JobPipe: Detected iCIMS platform, using specialized extraction');
+    return extractICIMS();
+  }
+
   // Check for common job platform patterns in URL
   if (fullUrl.includes('/job/') || fullUrl.includes('/jobs/')) {
     console.log('JobPipe: Detected job URL pattern, using generic extraction with enhanced title detection');
+    // Check if it's a known platform from URL
+    if (hostname.includes('greenhouse.io')) {
+      console.log('JobPipe: Detected Greenhouse platform from URL');
+      return extractGreenhouseBoard();
+    }
+  }
+
+  // === NEW PLATFORM DETECTION ===
+  
+  // Paylocity
+  if (hostname.includes('paylocity.com')) {
+    console.log('JobPipe: Detected Paylocity platform, using specialized extraction');
+    return extractPaylocity();
+  }
+  
+  // BambooHR
+  if (hostname.includes('bamboohr.com')) {
+    console.log('JobPipe: Detected BambooHR platform, using specialized extraction');
+    return extractBambooHR();
+  }
+  
+  // Workday
+  if (hostname.includes('myworkdayjobs.com')) {
+    console.log('JobPipe: Detected Workday platform, using specialized extraction');
+    return extractWorkday();
+  }
+  
+  // GoHire
+  if (hostname.includes('gohire.io')) {
+    console.log('JobPipe: Detected GoHire platform, using specialized extraction');
+    return extractGoHire();
+  }
+  
+  // ADP
+  if (hostname.includes('workforcenow.adp.com')) {
+    console.log('JobPipe: Detected ADP platform, using specialized extraction');
+    return extractADP();
+  }
+  
+  // SuccessFactors
+  if (hostname.includes('successfactors.eu')) {
+    console.log('JobPipe: Detected SuccessFactors platform, using specialized extraction');
+    return extractSuccessFactors();
+  }
+  
+  // Ashby
+  if (hostname.includes('ashbyhq.com')) {
+    console.log('JobPipe: Detected Ashby platform, using specialized extraction');
+    return extractAshby();
+  }
+  
+  // CareerPlug
+  if (hostname.includes('careerplug.com')) {
+    console.log('JobPipe: Detected CareerPlug platform, using specialized extraction');
+    return extractCareerPlug();
+  }
+  
+  // Genesis
+  if (hostname.includes('genesiscareers.jobs')) {
+    console.log('JobPipe: Detected Genesis platform, using specialized extraction');
+    return extractGenesis();
   }
 
   return extractGeneric();
@@ -516,6 +904,492 @@ function extractOasisRecruit() {
     };
   } catch (error) {
     console.error('Error extracting OasisRecruit job:', error);
+    return null;
+  }
+}
+
+// ==================== NEW PLATFORM EXTRACTORS ====================
+
+/**
+ * Extract job data from Paylocity (recruiting.paylocity.com)
+ */
+function extractPaylocity() {
+  try {
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('[class*="job-title"]') ||
+                    document.querySelector('title');
+    const title = titleEl ? titleEl.textContent.trim().replace(/\s*[-|]\s*.*$/, '').trim() : document.title;
+
+    let company = 'Unknown Company';
+    const companyEl = document.querySelector('[class*="company"]') ||
+                     document.querySelector('[class*="employer"]') ||
+                     document.querySelector('meta[property="og:site_name"]');
+    if (companyEl) {
+      company = companyEl.getAttribute('content') || companyEl.textContent.trim();
+    } else {
+      const hostname = window.location.hostname;
+      if (hostname.includes('paylocity.com')) {
+        company = 'Paylocity Client';
+      }
+    }
+
+    const descriptionEl = document.querySelector('[class*="description"]') ||
+                          document.querySelector('[class*="content"]') ||
+                          document.querySelector('[class*="detail"]') ||
+                          document.querySelector('article') ||
+                          document.querySelector('main');
+
+    if (!descriptionEl) {
+      console.log('JobPipe: Paylocity - no description found');
+      return null;
+    }
+
+    const urlPath = window.location.pathname;
+    const jobIdMatch = urlPath.match(/\/Details\/(\d+)/i);
+    const jobId = jobIdMatch ? `paylocity-${jobIdMatch[1]}` : `paylocity-${window.location.href.split('/').pop()}`;
+
+    console.log(`JobPipe: Paylocity extracted - Title="${title}" Company="${company}"`);
+
+    return {
+      id: jobId,
+      platform: 'paylocity',
+      title: title,
+      company: company,
+      url: window.location.href.split('?')[0],
+      description: descriptionEl.textContent.trim(),
+    };
+  } catch (error) {
+    console.error('Error extracting Paylocity job:', error);
+    return null;
+  }
+}
+
+/**
+ * Extract job data from BambooHR (*.bamboohr.com/careers/*)
+ */
+function extractBambooHR() {
+  try {
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('[class*="job-title"]') ||
+                    document.querySelector('title');
+    const title = titleEl ? titleEl.textContent.trim().replace(/\s*[-|]\s*.*$/, '').trim() : document.title;
+
+    let company = 'Unknown Company';
+    const hostname = window.location.hostname;
+    const subdomainMatch = hostname.match(/^([^.]+)\.bamboohr\.com/);
+    if (subdomainMatch && subdomainMatch[1]) {
+      company = subdomainMatch[1]
+        .split(/[-_]/)
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(' ');
+    }
+
+    const descriptionEl = document.querySelector('[class*="description"]') ||
+                          document.querySelector('[class*="content"]') ||
+                          document.querySelector('[class*="detail"]') ||
+                          document.querySelector('article') ||
+                          document.querySelector('main');
+
+    if (!descriptionEl) {
+      console.log('JobPipe: BambooHR - no description found');
+      return null;
+    }
+
+    const urlPath = window.location.pathname;
+    const jobIdMatch = urlPath.match(/\/careers?\/(\d+)/i);
+    const jobId = jobIdMatch ? `bamboohr-${jobIdMatch[1]}` : `bamboohr-${window.location.href.split('/').pop()}`;
+
+    console.log(`JobPipe: BambooHR extracted - Title="${title}" Company="${company}"`);
+
+    return {
+      id: jobId,
+      platform: 'bamboohr',
+      title: title,
+      company: company,
+      url: window.location.href.split('?')[0],
+      description: descriptionEl.textContent.trim(),
+    };
+  } catch (error) {
+    console.error('Error extracting BambooHR job:', error);
+    return null;
+  }
+}
+
+/**
+ * Extract job data from Workday (*.myworkdayjobs.com)
+ */
+function extractWorkday() {
+  try {
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('[class*="job-title"]') ||
+                    document.querySelector('[data-automation-id="jobPostingHeader"]') ||
+                    document.querySelector('title');
+    const title = titleEl ? titleEl.textContent.trim().replace(/\s*[-|]\s*.*$/, '').trim() : document.title;
+
+    let company = 'Unknown Company';
+    const hostname = window.location.hostname;
+    const subdomainMatch = hostname.match(/^([^.]+)\.wd\d*\.myworkdayjobs\.com/);
+    if (subdomainMatch && subdomainMatch[1]) {
+      company = subdomainMatch[1]
+        .split(/[-_]/)
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(' ');
+    }
+
+    const companyEl = document.querySelector('[class*="company"]') ||
+                     document.querySelector('[class*="employer"]') ||
+                     document.querySelector('[data-automation-id="subtitle"]');
+    if (companyEl) {
+      company = companyEl.textContent.trim() || company;
+    }
+
+    const descriptionEl = document.querySelector('[class*="description"]') ||
+                          document.querySelector('[class*="content"]') ||
+                          document.querySelector('[class*="detail"]') ||
+                          document.querySelector('[data-automation-id="jobPostingDescription"]') ||
+                          document.querySelector('article') ||
+                          document.querySelector('main');
+
+    if (!descriptionEl) {
+      console.log('JobPipe: Workday - no description found');
+      return null;
+    }
+
+    const urlPath = window.location.pathname;
+    const jobIdMatch = urlPath.match(/\/job\/([^/]+)\/([^/]+)/i);
+    const jobId = jobIdMatch ? `workday-${jobIdMatch[2]}` : `workday-${window.location.href.split('/').pop()}`;
+
+    console.log(`JobPipe: Workday extracted - Title="${title}" Company="${company}"`);
+
+    return {
+      id: jobId,
+      platform: 'workday',
+      title: title,
+      company: company,
+      url: window.location.href.split('?')[0],
+      description: descriptionEl.textContent.trim(),
+    };
+  } catch (error) {
+    console.error('Error extracting Workday job:', error);
+    return null;
+  }
+}
+
+/**
+ * Extract job data from GoHire (jobs.gohire.io)
+ */
+function extractGoHire() {
+  try {
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('[class*="job-title"]') ||
+                    document.querySelector('title');
+    const title = titleEl ? titleEl.textContent.trim().replace(/\s*[-|]\s*.*$/, '').trim() : document.title;
+
+    let company = 'Unknown Company';
+    const companyEl = document.querySelector('[class*="company"]') ||
+                     document.querySelector('[class*="employer"]') ||
+                     document.querySelector('[class*="organization"]');
+    if (companyEl) {
+      company = companyEl.textContent.trim();
+    } else {
+      const hostname = window.location.hostname;
+      if (hostname.includes('gohire.io')) {
+        company = 'GoHire Client';
+      }
+    }
+
+    const descriptionEl = document.querySelector('[class*="description"]') ||
+                          document.querySelector('[class*="content"]') ||
+                          document.querySelector('[class*="detail"]') ||
+                          document.querySelector('article') ||
+                          document.querySelector('main');
+
+    if (!descriptionEl) {
+      console.log('JobPipe: GoHire - no description found');
+      return null;
+    }
+
+    const urlPath = window.location.pathname;
+    const jobIdMatch = urlPath.match(/\/(\w+)\/(\d+)/i);
+    const jobId = jobIdMatch ? `gohire-${jobIdMatch[2]}` : `gohire-${window.location.href.split('/').pop()}`;
+
+    console.log(`JobPipe: GoHire extracted - Title="${title}" Company="${company}"`);
+
+    return {
+      id: jobId,
+      platform: 'gohire',
+      title: title,
+      company: company,
+      url: window.location.href.split('?')[0],
+      description: descriptionEl.textContent.trim(),
+    };
+  } catch (error) {
+    console.error('Error extracting GoHire job:', error);
+    return null;
+  }
+}
+
+/**
+ * Extract job data from ADP (workforcenow.adp.com)
+ */
+function extractADP() {
+  try {
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('[class*="job-title"]') ||
+                    document.querySelector('title');
+    const title = titleEl ? titleEl.textContent.trim().replace(/\s*[-|]\s*.*$/, '').trim() : document.title;
+
+    let company = 'Unknown Company';
+    const companyEl = document.querySelector('[class*="company"]') ||
+                     document.querySelector('[class*="employer"]') ||
+                     document.querySelector('[class*="organization"]') ||
+                     document.querySelector('meta[property="og:site_name"]');
+    if (companyEl) {
+      company = companyEl.getAttribute('content') || companyEl.textContent.trim();
+    }
+
+    const descriptionEl = document.querySelector('[class*="description"]') ||
+                          document.querySelector('[class*="content"]') ||
+                          document.querySelector('[class*="detail"]') ||
+                          document.querySelector('article') ||
+                          document.querySelector('main');
+
+    if (!descriptionEl) {
+      console.log('JobPipe: ADP - no description found');
+      return null;
+    }
+
+    const urlHash = window.location.href.split('?')[0].replace(/[^a-zA-Z0-9]/g, '_').substring(0, 64);
+    const jobId = `adp-${urlHash}`;
+
+    console.log(`JobPipe: ADP extracted - Title="${title}" Company="${company}"`);
+
+    return {
+      id: jobId,
+      platform: 'adp',
+      title: title,
+      company: company,
+      url: window.location.href.split('?')[0],
+      description: descriptionEl.textContent.trim(),
+    };
+  } catch (error) {
+    console.error('Error extracting ADP job:', error);
+    return null;
+  }
+}
+
+/**
+ * Extract job data from SuccessFactors (*.successfactors.eu)
+ */
+function extractSuccessFactors() {
+  try {
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('[class*="job-title"]') ||
+                    document.querySelector('[data-testid="job-title"]') ||
+                    document.querySelector('title');
+    const title = titleEl ? titleEl.textContent.trim().replace(/\s*[-|]\s*.*$/, '').trim() : document.title;
+
+    let company = 'Unknown Company';
+    const companyEl = document.querySelector('[class*="company"]') ||
+                     document.querySelector('[class*="employer"]') ||
+                     document.querySelector('[class*="organization"]') ||
+                     document.querySelector('meta[property="og:site_name"]');
+    if (companyEl) {
+      company = companyEl.getAttribute('content') || companyEl.textContent.trim();
+    } else {
+      const hostname = window.location.hostname;
+      if (hostname.includes('successfactors.eu')) {
+        company = 'SuccessFactors Client';
+      }
+    }
+
+    const descriptionEl = document.querySelector('[class*="description"]') ||
+                          document.querySelector('[class*="content"]') ||
+                          document.querySelector('[class*="detail"]') ||
+                          document.querySelector('[data-testid="job-description"]') ||
+                          document.querySelector('article') ||
+                          document.querySelector('main');
+
+    if (!descriptionEl) {
+      console.log('JobPipe: SuccessFactors - no description found');
+      return null;
+    }
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const jobId = urlParams.get('career_job_req_id') || urlParams.get('jobId') || window.location.href.split('/').pop();
+    const jobIdClean = `successfactors-${jobId}`;
+
+    console.log(`JobPipe: SuccessFactors extracted - Title="${title}" Company="${company}"`);
+
+    return {
+      id: jobIdClean,
+      platform: 'successfactors',
+      title: title,
+      company: company,
+      url: window.location.href.split('?')[0],
+      description: descriptionEl.textContent.trim(),
+    };
+  } catch (error) {
+    console.error('Error extracting SuccessFactors job:', error);
+    return null;
+  }
+}
+
+/**
+ * Extract job data from Ashby (jobs.ashbyhq.com)
+ */
+function extractAshby() {
+  try {
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('[class*="job-title"]') ||
+                    document.querySelector('title');
+    const title = titleEl ? titleEl.textContent.trim().replace(/\s*[-|]\s*.*$/, '').trim() : document.title;
+
+    let company = 'Unknown Company';
+    const urlPath = window.location.pathname;
+    const companyMatch = urlPath.match(/^\/([^/]+)/);
+    if (companyMatch && companyMatch[1]) {
+      company = companyMatch[1]
+        .split(/[-_]/)
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(' ');
+    }
+
+    const descriptionEl = document.querySelector('[class*="description"]') ||
+                          document.querySelector('[class*="content"]') ||
+                          document.querySelector('[class*="detail"]') ||
+                          document.querySelector('article') ||
+                          document.querySelector('main');
+
+    if (!descriptionEl) {
+      console.log('JobPipe: Ashby - no description found');
+      return null;
+    }
+
+    const jobIdMatch = urlPath.match(/\/([a-f0-9-]{36})/i);
+    const jobId = jobIdMatch ? `ashby-${jobIdMatch[1]}` : `ashby-${window.location.href.split('/').pop()}`;
+
+    console.log(`JobPipe: Ashby extracted - Title="${title}" Company="${company}"`);
+
+    return {
+      id: jobId,
+      platform: 'ashby',
+      title: title,
+      company: company,
+      url: window.location.href.split('?')[0],
+      description: descriptionEl.textContent.trim(),
+    };
+  } catch (error) {
+    console.error('Error extracting Ashby job:', error);
+    return null;
+  }
+}
+
+/**
+ * Extract job data from CareerPlug (app.careerplug.com)
+ */
+function extractCareerPlug() {
+  try {
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('[class*="job-title"]') ||
+                    document.querySelector('title');
+    const title = titleEl ? titleEl.textContent.trim().replace(/\s*[-|]\s*.*$/, '').trim() : document.title;
+
+    let company = 'Unknown Company';
+    const companyEl = document.querySelector('[class*="company"]') ||
+                     document.querySelector('[class*="employer"]') ||
+                     document.querySelector('[class*="organization"]');
+    if (companyEl) {
+      company = companyEl.textContent.trim();
+    }
+
+    const descriptionEl = document.querySelector('[class*="description"]') ||
+                          document.querySelector('[class*="content"]') ||
+                          document.querySelector('[class*="detail"]') ||
+                          document.querySelector('article') ||
+                          document.querySelector('main');
+
+    if (!descriptionEl) {
+      console.log('JobPipe: CareerPlug - no description found');
+      return null;
+    }
+
+    const urlPath = window.location.pathname;
+    const jobIdMatch = urlPath.match(/\/jobs?\/(\d+)/i);
+    const jobId = jobIdMatch ? `careerplug-${jobIdMatch[1]}` : `careerplug-${window.location.href.split('/').pop()}`;
+
+    console.log(`JobPipe: CareerPlug extracted - Title="${title}" Company="${company}"`);
+
+    return {
+      id: jobId,
+      platform: 'careerplug',
+      title: title,
+      company: company,
+      url: window.location.href.split('?')[0],
+      description: descriptionEl.textContent.trim(),
+    };
+  } catch (error) {
+    console.error('Error extracting CareerPlug job:', error);
+    return null;
+  }
+}
+
+/**
+ * Extract job data from Genesis (*.genesiscareers.jobs)
+ */
+function extractGenesis() {
+  try {
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('[class*="job-title"]') ||
+                    document.querySelector('title');
+    const title = titleEl ? titleEl.textContent.trim().replace(/\s*[-|]\s*.*$/, '').trim() : document.title;
+
+    let company = 'Unknown Company';
+    const hostname = window.location.hostname;
+    const subdomainMatch = hostname.match(/^([^.]+)\.genesiscareers\.jobs/);
+    if (subdomainMatch && subdomainMatch[1]) {
+      company = subdomainMatch[1]
+        .split(/[-_]/)
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(' ');
+    }
+
+    const descriptionEl = document.querySelector('[class*="description"]') ||
+                          document.querySelector('[class*="content"]') ||
+                          document.querySelector('[class*="detail"]') ||
+                          document.querySelector('article') ||
+                          document.querySelector('main');
+
+    if (!descriptionEl) {
+      console.log('JobPipe: Genesis - no description found');
+      return null;
+    }
+
+    const urlPath = window.location.pathname;
+    const jobIdMatch = urlPath.match(/\/jobs?\/(\d+)/i);
+    const jobId = jobIdMatch ? `genesis-${jobIdMatch[1]}` : `genesis-${window.location.href.split('/').pop()}`;
+
+    console.log(`JobPipe: Genesis extracted - Title="${title}" Company="${company}"`);
+
+    return {
+      id: jobId,
+      platform: 'genesis',
+      title: title,
+      company: company,
+      url: window.location.href.split('?')[0],
+      description: descriptionEl.textContent.trim(),
+    };
+  } catch (error) {
+    console.error('Error extracting Genesis job:', error);
     return null;
   }
 }
@@ -1225,6 +2099,34 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ success: true });
     return false;
   }
+
+  // Handle exclude site request from popup
+  if (request.action === 'EXCLUDE_SITE') {
+    excludeCurrentSite().then(() => {
+      sendResponse({ success: true });
+      // Update overlay to show excluded status
+      updateOverlayStatus('Site excluded', 0, 0, 'Marked as not a job board');
+    });
+    return true; // Async response
+  }
+
+  // Handle include site request from popup
+  if (request.action === 'INCLUDE_SITE') {
+    includeCurrentSite().then(() => {
+      sendResponse({ success: true });
+      // Reset auto-scrape flag to allow re-scraping
+      autoScrapeAttempted = false;
+    });
+    return true; // Async response
+  }
+
+  // Check if current site is excluded
+  if (request.action === 'CHECK_EXCLUDED') {
+    isCurrentSiteExcluded().then((excluded) => {
+      sendResponse({ success: true, excluded });
+    });
+    return true; // Async response
+  }
 });
 
 // Track sent URLs locally to prevent double-sends within the same page load
@@ -1541,6 +2443,15 @@ async function attemptAutoScrape() {
   autoScrapeAttempted = true;
 
   const hostname = window.location.hostname.toLowerCase();
+  
+  // Check if this hostname is marked as "not a job board"
+  const excludedHosts = await getExcludedHosts();
+  if (excludedHosts.has(hostname)) {
+    console.log('JobPipe: Skipping auto-scrape - site marked as not a job board:', hostname);
+    updateOverlayStatus('Site excluded', 0, 0, 'Marked as not a job board');
+    return;
+  }
+  
   // Log the site we're attempting to scrape (now supports any site)
   console.log('JobPipe: Attempting auto-scrape on:', window.location.href, '(' + hostname + ')');
 
@@ -1638,7 +2549,19 @@ async function attemptAutoScrape() {
       const sentCount = response.count || jobs.length;
       const successLabel = isDetailPage && jobs.length === 1 ? 'Enriched ✓' : 'Success ✓';
       const displayTitle = jobs[0]?.title || 'Unknown Job';
-      updateOverlayStatus(successLabel, jobs.length, sentCount, displayTitle);
+      
+      // Show server response confirmation if available
+      let serverMsg = '';
+      if (response && response.result) {
+        const r = response.result;
+        serverMsg = ` (inserted: ${r.inserted}, updated: ${r.updated})`;
+        console.log(`JobPipe: Server confirmed - inserted=${r.inserted}, updated=${r.updated}, run=${r.run_id}`);
+        if (r.updated > 0 && isDetailPage) {
+          console.log(`JobPipe: ✅ Enriched job "${displayTitle}" updated existing database record`);
+        }
+      }
+      
+      updateOverlayStatus(successLabel + serverMsg, jobs.length, sentCount, displayTitle);
       safeSendMessage({
         action: 'SCRAPE_STATUS_UPDATE',
         status: successLabel,

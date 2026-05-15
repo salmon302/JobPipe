@@ -14,6 +14,7 @@ from jobpipe.config import Settings
 from jobpipe.gui.latex_editor import LatexEditor
 from jobpipe.gui.services import DashboardSnapshot, JobPipeGuiService
 from jobpipe.ingest.server import IngestServer
+from jobpipe.scoring.attainability import _infer_seniority_hint
 
 try:
     from PySide6.QtCore import (
@@ -36,6 +37,7 @@ try:
         QFrame,
         QFormLayout,
         QGridLayout,
+        QGroupBox,
         QHBoxLayout,
         QLabel,
         QLineEdit,
@@ -47,7 +49,7 @@ try:
         QSpinBox,
         QSplitter,
         QMenu,
-            QTableWidget,
+        QTableWidget,
         QTableWidgetItem,
         QTabWidget,
         QVBoxLayout,
@@ -65,10 +67,19 @@ def _format_datetime(value: datetime | None) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _format_score(value: float | None) -> str:
+def _format_score(value: float | str | None) -> str:
     if value is None:
         return "n/a"
-    return f"{value:.3f}"
+    # Handle case where value is already a string
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return value  # Return as-is if not a valid float
+    try:
+        return f"{value:.3f}"
+    except (ValueError, TypeError):
+        return str(value)
 
 
 def _is_truthy_env_value(value: str) -> bool:
@@ -115,19 +126,20 @@ class JobPipeMainWindow(QMainWindow):
         self._enrichment_poll_max = 15  # ~30 seconds max
         self._enrichment_job_id: str | None = None
         self._enrichment_job_row: int | None = None
+        self._pending_stage_after_enrichment: bool = False  # Flag for double-click staging
+
+        # Auto-refresh timer for database updates
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.setInterval(30000)  # Refresh every 30 seconds
+        self._auto_refresh_timer.timeout.connect(self.refresh_views)
 
         self._ingest_status_value = QLabel("Starting")
         self._ingest_endpoint_value = QLabel("n/a")
 
         self._settings_env_path_value = QLabel()
-        self._settings_notification_threshold_input = QLineEdit()
-        self._settings_user_years_input = QLineEdit()
         self._settings_ingest_host_input = QLineEdit()
         self._settings_ingest_port_input = QLineEdit()
         self._settings_ingest_payload_input = QLineEdit()
-        self._settings_critical_skills_input = QLineEdit()
-        self._settings_reject_terms_input = QLineEdit()
-        self._settings_auto_stage_checkbox = QCheckBox("Enable auto-stage job description")
         self._settings_reload_button = QPushButton("Reload")
         self._settings_save_button = QPushButton("Validate + Save")
         self._settings_status_value = QLabel("Not loaded")
@@ -160,7 +172,7 @@ class JobPipeMainWindow(QMainWindow):
         self._last_run_summary_value = QLabel("n/a")
 
         self._jobs_table = self._create_table(
-            ["Total", "Relevance", "Attainability", "Recency", "Title", "Company", "Platform", "Status", "Posted", "URL"]
+            ["Total", "Relevance", "Attainability", "Recency", "Seniority", "Title", "Company", "Platform", "Status", "Posted", "URL"]
         )
         self._jobs_search_input = QLineEdit()
         self._jobs_search_input.setPlaceholderText("Search title, company, description, location...")
@@ -174,6 +186,110 @@ class JobPipeMainWindow(QMainWindow):
         self._jobs_results_label.setProperty("role", "muted")
         self._jobs_count_label = QLabel("Jobs: 0 | Companies: 0")
         self._jobs_count_label.setProperty("role", "muted")
+
+        # --- Jobs tab sidebar filter controls ---
+        # Seniority filter checkboxes (all checked = show all)
+        self._filter_seniority_entry = QCheckBox("Entry / Junior")
+        self._filter_seniority_entry.setChecked(True)
+        self._filter_seniority_mid = QCheckBox("Mid-Level")
+        self._filter_seniority_mid.setChecked(True)
+        self._filter_seniority_senior = QCheckBox("Senior / Lead")
+        self._filter_seniority_senior.setChecked(True)
+        self._filter_seniority_manager = QCheckBox("Manager")
+        self._filter_seniority_manager.setChecked(True)
+
+        # --- Job Preferences (moved from Settings tab) ---
+        self._filter_notification_threshold = QLineEdit()
+        self._filter_notification_threshold.setPlaceholderText("0.80")
+        self._filter_notification_threshold.setText("0.80")  # Minimal default
+        self._filter_user_years = QLineEdit()
+        self._filter_user_years.setPlaceholderText("1")
+        self._filter_user_years.setText("1")  # Minimal default
+        self._filter_critical_skills = QLineEdit()
+        self._filter_critical_skills.setPlaceholderText("python,fastapi,sql,aws")
+        self._filter_critical_skills.setText("")  # Empty by default
+        self._filter_reject_terms = QLineEdit()
+        self._filter_reject_terms.setPlaceholderText("senior,staff,principal,architect")
+        self._filter_reject_terms.setText("")  # Empty by default
+        self._filter_auto_stage = QCheckBox("Enable auto-stage job description")
+        self._filter_auto_stage.setChecked(False)  # Disabled by default
+
+        # --- Scoring Weights (moved from Settings tab) ---
+        self._filter_relevance_slider = QSlider(Qt.Orientation.Horizontal)
+        self._filter_relevance_slider.setRange(0, 100)
+        self._filter_relevance_slider.setValue(50)
+        self._filter_relevance_label = QLabel("Relevance: 0.50")
+        
+        self._filter_attainability_slider = QSlider(Qt.Orientation.Horizontal)
+        self._filter_attainability_slider.setRange(0, 100)
+        self._filter_attainability_slider.setValue(30)
+        self._filter_attainability_label = QLabel("Attainability: 0.30")
+        
+        self._filter_recency_slider = QSlider(Qt.Orientation.Horizontal)
+        self._filter_recency_slider.setRange(0, 100)
+        self._filter_recency_slider.setValue(20)
+        self._filter_recency_label = QLabel("Recency: 0.20")
+
+        # --- Age Filter ---
+        self._filter_reject_old_jobs = QCheckBox("Reject jobs that are too old")
+        self._filter_reject_old_jobs.setChecked(False)  # Disabled by default
+        self._filter_max_job_age = QSpinBox()
+        self._filter_max_job_age.setRange(1, 365)
+        self._filter_max_job_age.setValue(30)
+        self._filter_max_job_age.setSuffix(" days")
+
+        # --- Job Preferences (moved from Settings tab) ---
+        self._filter_notification_threshold = QLineEdit()
+        self._filter_notification_threshold.setPlaceholderText("0.80")
+        self._filter_user_years = QLineEdit()
+        self._filter_user_years.setPlaceholderText("1")
+        self._filter_critical_skills = QLineEdit()
+        self._filter_critical_skills.setPlaceholderText("python,fastapi,sql,aws")
+        self._filter_reject_terms = QLineEdit()
+        self._filter_reject_terms.setPlaceholderText("senior,staff,principal,architect")
+        self._filter_auto_stage = QCheckBox("Enable auto-stage job description")
+        self._filter_auto_stage.setChecked(True)
+
+        # --- Scoring Weights (moved from Settings tab) ---
+        self._filter_relevance_slider = QSlider(Qt.Orientation.Horizontal)
+        self._filter_relevance_slider.setRange(0, 100)
+        self._filter_relevance_slider.setValue(50)
+        self._filter_relevance_label = QLabel("Relevance: 0.50")
+        
+        self._filter_attainability_slider = QSlider(Qt.Orientation.Horizontal)
+        self._filter_attainability_slider.setRange(0, 100)
+        self._filter_attainability_slider.setValue(30)
+        self._filter_attainability_label = QLabel("Attainability: 0.30")
+        
+        self._filter_recency_slider = QSlider(Qt.Orientation.Horizontal)
+        self._filter_recency_slider.setRange(0, 100)
+        self._filter_recency_slider.setValue(20)
+        self._filter_recency_label = QLabel("Recency: 0.20")
+
+        # --- Age Filter ---
+        self._filter_reject_old_jobs = QCheckBox("Reject jobs that are too old")
+        self._filter_reject_old_jobs.setChecked(True)
+        self._filter_max_job_age = QSpinBox()
+        self._filter_max_job_age.setRange(1, 365)
+        self._filter_max_job_age.setValue(30)
+        self._filter_max_job_age.setSuffix(" days")
+
+        # Score minimum sliders (0 = no filter)
+        self._filter_min_total = QSlider(Qt.Orientation.Horizontal)
+        self._filter_min_total.setRange(0, 100)
+        self._filter_min_total.setValue(0)
+        self._filter_min_total_label = QLabel("Min Total: 0.00")
+
+        self._filter_min_relevance = QSlider(Qt.Orientation.Horizontal)
+        self._filter_min_relevance.setRange(0, 100)
+        self._filter_min_relevance.setValue(0)
+        self._filter_min_relevance_label = QLabel("Min Relevance: 0.00")
+
+        self._filter_min_attainability = QSlider(Qt.Orientation.Horizontal)
+        self._filter_min_attainability.setRange(0, 100)
+        self._filter_min_attainability.setValue(0)
+        self._filter_min_attainability_label = QLabel("Min Attainability: 0.00")
+        
         self._runs_table = self._create_table(
             [
                 "Status",
@@ -205,10 +321,13 @@ class JobPipeMainWindow(QMainWindow):
         self._start_ingest_server()
         self.refresh_views()
         self._load_settings_form_values(silent=True)
+        self._auto_refresh_timer.start()  # Start auto-refresh
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._ingest_server is not None:
             self._ingest_server.stop()
+        if hasattr(self, '_auto_refresh_timer') and self._auto_refresh_timer.isActive():
+            self._auto_refresh_timer.stop()
         super().closeEvent(event)
 
     def showEvent(self, event) -> None:  # noqa: N802
@@ -232,179 +351,220 @@ class JobPipeMainWindow(QMainWindow):
             """
             QMainWindow {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #f7f4ee, stop:1 #e6eef1);
-                color: #1e2a32;
+                    stop:0 #1a1a2e, stop:1 #16213e);
+                color: #e0e0e0;
             }
             #appRoot {
                 background: transparent;
             }
             #headerBar {
-                background: #ffffff;
-                border: 1px solid #e4d8cc;
+                background: #0f3460;
+                border: 1px solid #1a1a2e;
                 border-radius: 12px;
             }
             #pageTitle {
                 font-size: 22px;
                 font-weight: 700;
                 letter-spacing: 0.5px;
+                color: #ffffff;
             }
             #pageSubtitle {
-                color: #5c6b74;
+                color: #a0a0a0;
             }
             QMenuBar {
-                background: #f6f0ea;
-                border-bottom: 1px solid #e4d8cc;
+                background: #0f3460;
+                border-bottom: 1px solid #1a1a2e;
             }
             QMenuBar::item {
                 background: transparent;
                 padding: 6px 10px;
-                color: #1e2a32;
+                color: #e0e0e0;
             }
             QMenuBar::item:selected {
-                background: #1f6f8b;
+                background: #533483;
                 color: #ffffff;
                 border-radius: 6px;
             }
             QMenu {
-                background: #ffffff;
-                border: 1px solid #e4d8cc;
+                background: #1a1a2e;
+                border: 1px solid #0f3460;
             }
             QMenu::item {
                 padding: 6px 12px;
+                color: #e0e0e0;
             }
             QMenu::item:selected {
-                background: #1f6f8b;
+                background: #533483;
                 color: #ffffff;
             }
             QStatusBar {
-                background: #f6f0ea;
-                border-top: 1px solid #e4d8cc;
-                color: #1e2a32;
+                background: #0f3460;
+                border-top: 1px solid #1a1a2e;
+                color: #e0e0e0;
             }
             QStatusBar::item {
                 border: 0;
             }
             QTabWidget::pane {
-                background: #ffffff;
-                border: 1px solid #e4d8cc;
+                background: #1a1a2e;
+                border: 1px solid #0f3460;
                 border-radius: 8px;
                 padding: 8px;
             }
             QTabBar::tab {
-                background: #f2ede7;
-                color: #2b3a42;
-                border: 1px solid #e4d8cc;
+                background: #16213e;
+                color: #a0a0a0;
+                border: 1px solid #0f3460;
                 border-bottom: 0;
                 padding: 7px 12px;
                 margin-right: 4px;
             }
             QTabBar::tab:selected {
                 color: #ffffff;
-                background: #1f6f8b;
-                border-color: #1f6f8b;
+                background: #533483;
+                border-color: #533483;
             }
             QTabBar::tab:!selected {
                 margin-top: 2px;
             }
             QTabBar::tab:hover {
-                background: #efe6dc;
+                background: #1a1a2e;
             }
             QFrame[role="card"],
             QFrame[role="metricCard"] {
-                background: #ffffff;
-                border: 1px solid #e4d8cc;
+                background: #16213e;
+                border: 1px solid #0f3460;
                 border-radius: 10px;
             }
             QFrame[role="chip"] {
-                background: #f6f0ea;
-                border: 1px solid #e4d8cc;
+                background: #0f3460;
+                border: 0;
                 border-radius: 10px;
             }
             QLabel[role="chipLabel"] {
                 font-size: 9pt;
-                color: #6e7a83;
+                color: #a0a0a0;
             }
             QLabel[role="chipValue"] {
                 font-weight: 700;
-                color: #1e2a32;
+                color: #e0e0e0;
             }
             QLabel#cardTitle {
                 font-size: 10pt;
                 font-weight: 600;
-                color: #4b5d6a;
+                color: #e94560;
             }
             QLabel#metricTitle {
                 font-size: 9pt;
                 font-weight: 600;
-                color: #6e7a83;
+                color: #a0a0a0;
             }
             QLabel[role="metricValue"] {
                 font-size: 13pt;
                 font-weight: 700;
+                color: #e0e0e0;
             }
             QLabel[role="statusBadge"] {
-                background: #f6f0ea;
-                border: 1px solid #e4d8cc;
+                background: #0f3460;
+                border: 1px solid #533483;
                 border-radius: 8px;
                 padding: 4px 8px;
                 font-weight: 600;
-                color: #1e2a32;
+                color: #e0e0e0;
             }
             QLabel[role="muted"] {
-                color: #6e7a83;
+                color: #a0a0a0;
+            }
+            QLabel[role="formLabel"] {
+                color: #e0e0e0;
+                font-weight: 600;
             }
             QLineEdit, QPlainTextEdit, QTableWidget {
-                background: #ffffff;
-                border: 1px solid #d9cfc4;
+                background: #16213e;
+                border: 1px solid #0f3460;
                 border-radius: 8px;
                 padding: 6px;
-                selection-background-color: #1f6f8b;
-                color: #1e2a32;
+                selection-background-color: #533483;
+                color: #e0e0e0;
             }
             QPlainTextEdit#detailsText {
-                background: #fbf7f2;
+                background: #1a1a2e;
             }
             QHeaderView::section {
-                background: #efe8df;
-                color: #2b3a42;
+                background: #0f3460;
+                color: #e0e0e0;
                 border: 0;
-                border-bottom: 1px solid #d9cfc4;
+                border-bottom: 1px solid #533483;
                 padding: 6px;
                 font-weight: 600;
             }
             QTableWidget {
-                gridline-color: #e7ddd3;
-                alternate-background-color: #fbf7f2;
+                gridline-color: #0f3460;
+                alternate-background-color: #1a1a2e;
             }
             QPushButton {
-                background: #ffffff;
-                border: 1px solid #cbbfb4;
+                background: #16213e;
+                border: 1px solid #0f3460;
                 border-radius: 8px;
                 padding: 6px 12px;
-                color: #1e2a32;
+                color: #e0e0e0;
             }
             QPushButton:hover {
-                background: #f2ece6;
+                background: #1a1a2e;
             }
             QPushButton#primaryButton {
-                background: #1f6f8b;
+                background: #533483;
                 color: #ffffff;
-                border-color: #1f6f8b;
+                border-color: #533483;
             }
             QPushButton#primaryButton:hover {
-                background: #1b6078;
+                background: #e94560;
             }
             QSlider::groove:horizontal {
                 height: 6px;
-                background: #e6ddd3;
+                background: #0f3460;
                 border-radius: 3px;
             }
             QSlider::handle:horizontal {
-                background: #1f6f8b;
-                border: 1px solid #1b6078;
+                background: #e94560;
+                border: 1px solid #533483;
                 width: 14px;
                 margin: -4px 0;
                 border-radius: 7px;
+            }
+            QCheckBox {
+                color: #e0e0e0;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 1px solid #0f3460;
+                border-radius: 3px;
+                background: #16213e;
+            }
+            QCheckBox::indicator:checked {
+                background: #533483;
+                border-color: #533483;
+            }
+            QGroupBox {
+                color: #e0e0e0;
+                border: 1px solid #0f3460;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                color: #e94560;
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+            QSpinBox {
+                background: #16213e;
+                border: 1px solid #0f3460;
+                border-radius: 8px;
+                padding: 4px;
+                color: #e0e0e0;
             }
             """
         )
@@ -413,7 +573,7 @@ class JobPipeMainWindow(QMainWindow):
         header = QFrame()
         header.setObjectName("headerBar")
         layout = QHBoxLayout(header)
-        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setContentsMargins(12, 6, 12, 6)
         layout.setSpacing(12)
 
         title = QLabel("JobPipe Control Center")
@@ -422,6 +582,7 @@ class JobPipeMainWindow(QMainWindow):
         subtitle.setObjectName("pageSubtitle")
 
         left = QVBoxLayout()
+        left.setSpacing(1)
         left.addWidget(title)
         left.addWidget(subtitle)
         layout.addLayout(left)
@@ -561,32 +722,43 @@ class JobPipeMainWindow(QMainWindow):
     def _build_jobs_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        layout.setSpacing(12)
+        layout.setSpacing(6)
 
-        # Counts label
+        # ---- Top bar: counts + search + actions ----
         counts_layout = QHBoxLayout()
+        counts_layout.setContentsMargins(0, 0, 0, 0)
+        counts_layout.setSpacing(6)
+        self._jobs_count_label.setMaximumHeight(20)
+        self._jobs_results_label.setMaximumHeight(20)
         counts_layout.addWidget(self._jobs_count_label)
         counts_layout.addWidget(self._jobs_results_label)
         counts_layout.addStretch(1)
         layout.addLayout(counts_layout)
 
         controls = QHBoxLayout()
-        controls.addWidget(QLabel("Search:"))
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(4)
+        search_label = QLabel("Search:")
+        search_label.setProperty("role", "formLabel")
+        controls.addWidget(search_label)
         controls.addWidget(self._jobs_search_input, 1)
-        self._jobs_search_input.returnPressed.connect(self.refresh_views)
+        self._jobs_search_input.returnPressed.connect(self._apply_job_filters)
 
-        self._jobs_search_button.clicked.connect(self.refresh_views)
+        self._jobs_search_button.clicked.connect(self._apply_job_filters)
         controls.addWidget(self._jobs_search_button)
 
         self._jobs_clear_search_button.clicked.connect(self._clear_job_search)
         controls.addWidget(self._jobs_clear_search_button)
 
-        controls.addWidget(QLabel("Limit:"))
+        limit_label = QLabel("Limit:")
+        limit_label.setProperty("role", "formLabel")
+        controls.addWidget(limit_label)
         controls.addWidget(self._jobs_limit_input)
-
-        refresh_button = QPushButton("Refresh")
-        refresh_button.clicked.connect(self.refresh_views)
-        controls.addWidget(refresh_button)
+        
+        recalc_button = QPushButton("Recalculate Scores")
+        recalc_button.setObjectName("primaryButton")
+        recalc_button.clicked.connect(self._recalculate_scores_clicked)
+        controls.addWidget(recalc_button)
 
         open_button = QPushButton("Open Selected Job")
         open_button.clicked.connect(self._open_selected_job_url)
@@ -598,14 +770,141 @@ class JobPipeMainWindow(QMainWindow):
 
         controls.addStretch(1)
         layout.addLayout(controls)
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(self._jobs_table)
+
+        # ---- Body: sidebar | table+details ----
+        body_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # -- Sidebar filters --
+        sidebar = QFrame()
+        sidebar.setProperty("role", "card")
+        sidebar.setMinimumWidth(180)  # Reduced from 200
+        sidebar.setMaximumWidth(240)  # Reduced from 280
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(6, 6, 6, 6)  # Tighter margins
+        sidebar_layout.setSpacing(4)  # Reduced spacing
+
+        # Filters header
+        filters_header = QLabel("Filters")
+        filters_header.setObjectName("cardTitle")
+        filters_header.setMaximumHeight(20)  # Smaller header
+        sidebar_layout.addWidget(filters_header)
+
+        # Seniority group - compact
+        seniority_group = QGroupBox("Seniority")
+        seniority_group_layout = QVBoxLayout(seniority_group)
+        seniority_group_layout.setSpacing(1)  # Tighter spacing
+        seniority_group_layout.setContentsMargins(6, 4, 6, 4)  # Tighter margins
+        seniority_group_layout.addWidget(self._filter_seniority_entry)
+        seniority_group_layout.addWidget(self._filter_seniority_mid)
+        seniority_group_layout.addWidget(self._filter_seniority_senior)
+        seniority_group_layout.addWidget(self._filter_seniority_manager)
+        sidebar_layout.addWidget(seniority_group)
+
+        # Score sliders group with explicit labels - compact
+        score_group = QGroupBox("Minimum Scores")
+        score_group_layout = QVBoxLayout(score_group)
+        score_group_layout.setSpacing(2)  # Tighter spacing
+        score_group_layout.setContentsMargins(6, 4, 6, 4)  # Tighter margins
+
+        self._filter_min_total_label = QLabel("Min Total: 0.00")
+        self._filter_min_total.valueChanged.connect(
+            lambda v: self._filter_min_total_label.setText(f"Min Total: {v/100:.2f}")
+        )
+        score_group_layout.addWidget(self._filter_min_total_label)
+        score_group_layout.addWidget(self._filter_min_total)
+
+        self._filter_min_relevance_label = QLabel("Min Relevance: 0.00")
+        self._filter_min_relevance.valueChanged.connect(
+            lambda v: self._filter_min_relevance_label.setText(f"Min Relevance: {v/100:.2f}")
+        )
+        score_group_layout.addWidget(self._filter_min_relevance_label)
+        score_group_layout.addWidget(self._filter_min_relevance)
+
+        self._filter_min_attainability_label = QLabel("Min Attainability: 0.00")
+        self._filter_min_attainability.valueChanged.connect(
+            lambda v: self._filter_min_attainability_label.setText(f"Min Attainability: {v/100:.2f}")
+        )
+        score_group_layout.addWidget(self._filter_min_attainability_label)
+        score_group_layout.addWidget(self._filter_min_attainability)
+
+        sidebar_layout.addWidget(score_group)
+
+        # ---- Job Preferences Group ---- compact
+        prefs_group = QGroupBox("Job Preferences")
+        prefs_layout = QFormLayout(prefs_group)
+        prefs_layout.setSpacing(2)  # Tighter spacing
+        prefs_layout.setContentsMargins(6, 4, 6, 4)  # Tighter margins
+        prefs_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)  # Smaller fields
+        prefs_layout.addRow("Notification Threshold", self._filter_notification_threshold)
+        prefs_layout.addRow("User Years Exp.", self._filter_user_years)
+        prefs_layout.addRow("Critical Skills (CSV)", self._filter_critical_skills)
+        prefs_layout.addRow("Reject Terms (CSV)", self._filter_reject_terms)
+        prefs_layout.addRow(self._filter_auto_stage)
+        sidebar_layout.addWidget(prefs_group)
+
+        # ---- Scoring Weights Group ---- compact
+        weights_group = QGroupBox("Scoring Weights")
+        weights_layout = QVBoxLayout(weights_group)
+        weights_layout.setSpacing(2)  # Tighter spacing
+        weights_layout.setContentsMargins(6, 4, 6, 4)  # Tighter margins
+        
+        # Connect sliders to update labels
+        self._filter_relevance_slider.valueChanged.connect(
+            lambda v: self._filter_relevance_label.setText(f"Relevance: {v/100:.2f}")
+        )
+        self._filter_attainability_slider.valueChanged.connect(
+            lambda v: self._filter_attainability_label.setText(f"Attainability: {v/100:.2f}")
+        )
+        self._filter_recency_slider.valueChanged.connect(
+            lambda v: self._filter_recency_label.setText(f"Recency: {v/100:.2f}")
+        )
+        
+        weights_layout.addWidget(self._filter_relevance_label)
+        weights_layout.addWidget(self._filter_relevance_slider)
+        weights_layout.addWidget(self._filter_attainability_label)
+        weights_layout.addWidget(self._filter_attainability_slider)
+        weights_layout.addWidget(self._filter_recency_label)
+        weights_layout.addWidget(self._filter_recency_slider)
+        sidebar_layout.addWidget(weights_group)
+
+        # ---- Age Filter Group ---- compact
+        age_group = QGroupBox("Age Filter")
+        age_layout = QVBoxLayout(age_group)
+        age_layout.setSpacing(2)  # Tighter spacing
+        age_layout.setContentsMargins(6, 4, 6, 4)  # Tighter margins
+        age_layout.addWidget(self._filter_reject_old_jobs)
+        age_layout.addWidget(QLabel("Max Job Age:"))
+        age_layout.addWidget(self._filter_max_job_age)
+        sidebar_layout.addWidget(age_group)
+
+        # Apply filters button
+        apply_filters_btn = QPushButton("Apply Filters")
+        apply_filters_btn.setObjectName("primaryButton")
+        apply_filters_btn.clicked.connect(self._apply_job_filters)
+        sidebar_layout.addWidget(apply_filters_btn)
+
+        # Reset filters button
+        reset_filters_btn = QPushButton("Reset Filters")
+        reset_filters_btn.clicked.connect(self._reset_job_filters)
+        sidebar_layout.addWidget(reset_filters_btn)
+
+        sidebar_layout.addStretch(1)
+        body_splitter.addWidget(sidebar)
+
+        # -- Right panel: table + details --
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+
+        vert_splitter = QSplitter(Qt.Orientation.Vertical)
+        vert_splitter.addWidget(self._jobs_table)
 
         # Job details panel
         details_panel = QFrame()
         details_panel.setProperty("role", "card")
         details_layout = QVBoxLayout(details_panel)
-        details_layout.setContentsMargins(12, 10, 12, 10)
+        details_layout.setContentsMargins(8, 6, 8, 6)
         details_label = QLabel("Job Details")
         details_label.setObjectName("cardTitle")
         self._job_details_text = QPlainTextEdit()
@@ -614,14 +913,22 @@ class JobPipeMainWindow(QMainWindow):
         self._job_details_text.setPlaceholderText("Select a job to view details...")
         details_layout.addWidget(details_label)
         details_layout.addWidget(self._job_details_text)
+        vert_splitter.addWidget(details_panel)
+        vert_splitter.setStretchFactor(0, 3)
+        vert_splitter.setStretchFactor(1, 1)
 
-        splitter.addWidget(details_panel)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 1)
-        layout.addWidget(splitter)
+        right_layout.addWidget(vert_splitter)
+        body_splitter.addWidget(right_panel)
+
+        body_splitter.setStretchFactor(0, 0)
+        body_splitter.setStretchFactor(1, 1)
+        layout.addWidget(body_splitter)
 
         # Connect selection change to show details
         self._jobs_table.selectionModel().selectionChanged.connect(self._on_job_selection_changed)
+
+        # Connect double-click to open job URL and auto-stage for resume
+        self._jobs_table.itemDoubleClicked.connect(self._on_job_double_clicked)
 
         # Add context menu for copy
         self._jobs_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -670,74 +977,38 @@ class JobPipeMainWindow(QMainWindow):
         layout = QVBoxLayout(widget)
         layout.setSpacing(12)
 
-        self._settings_notification_threshold_input.setPlaceholderText("0.80")
-        self._settings_user_years_input.setPlaceholderText("1")
         self._settings_ingest_host_input.setPlaceholderText("127.0.0.1")
         self._settings_ingest_port_input.setPlaceholderText("3838")
         self._settings_ingest_payload_input.setPlaceholderText("1000000")
-        self._settings_critical_skills_input.setPlaceholderText("python,fastapi,sql,aws")
-        self._settings_reject_terms_input.setPlaceholderText("senior,staff,principal,architect")
 
-        # Weight sliders (Phase 2)
-        self._relevance_slider = QSlider(Qt.Orientation.Horizontal)
-        self._relevance_slider.setRange(0, 100)
-        self._relevance_slider.setValue(50)
-        self._relevance_label = QLabel("Relevance: 0.50")
-        
-        self._attainability_slider = QSlider(Qt.Orientation.Horizontal)
-        self._attainability_slider.setRange(0, 100)
-        self._attainability_slider.setValue(30)
-        self._attainability_label = QLabel("Attainability: 0.30")
-        
-        self._recency_slider = QSlider(Qt.Orientation.Horizontal)
-        self._recency_slider.setRange(0, 100)
-        self._recency_slider.setValue(20)
-        self._recency_label = QLabel("Recency: 0.20")
-        
-        # Connect sliders to update labels
-        self._relevance_slider.valueChanged.connect(
-            lambda v: self._relevance_label.setText(f"Relevance: {v/100:.2f}")
-        )
-        self._attainability_slider.valueChanged.connect(
-            lambda v: self._attainability_label.setText(f"Attainability: {v/100:.2f}")
-        )
-        self._recency_slider.valueChanged.connect(
-            lambda v: self._recency_label.setText(f"Recency: {v/100:.2f}")
-        )
+        # Network Configuration Card
+        network_card = QFrame()
+        network_card.setProperty("role", "card")
+        network_layout = QVBoxLayout(network_card)
+        network_layout.setContentsMargins(12, 10, 12, 10)
+        network_title = QLabel("Network Configuration")
+        network_title.setObjectName("cardTitle")
+        network_layout.addWidget(network_title)
+        network_form = QFormLayout()
+        network_form.addRow("Env File", self._settings_env_path_value)
+        network_form.addRow("Ingest Host", self._settings_ingest_host_input)
+        network_form.addRow("Ingest Port", self._settings_ingest_port_input)
+        network_form.addRow("Ingest Max Payload", self._settings_ingest_payload_input)
+        network_layout.addLayout(network_form)
+        layout.addWidget(network_card)
 
-        form = QFormLayout()
-        form.addRow("Env File", self._settings_env_path_value)
-        form.addRow("Notification Threshold", self._settings_notification_threshold_input)
-        form.addRow("User Years Experience", self._settings_user_years_input)
-        form.addRow("Ingest Host", self._settings_ingest_host_input)
-        form.addRow("Ingest Port", self._settings_ingest_port_input)
-        form.addRow("Ingest Max Payload Bytes", self._settings_ingest_payload_input)
-        form.addRow("Critical Skills (CSV)", self._settings_critical_skills_input)
-        form.addRow("Reject Terms (CSV)", self._settings_reject_terms_input)
-        form.addRow("Flags", self._settings_auto_stage_checkbox)
-        form.addRow("Last Save Status", self._settings_status_value)
-        form_card = QFrame()
-        form_card.setProperty("role", "card")
-        form_layout = QVBoxLayout(form_card)
-        form_layout.setContentsMargins(12, 10, 12, 10)
-        form_layout.addLayout(form)
-        layout.addWidget(form_card)
-        
-        # Scoring Weights Section
-        weights_label = QLabel("Scoring Weights (Phase 2):")
-        weights_label.setObjectName("cardTitle")
-        weights_card = QFrame()
-        weights_card.setProperty("role", "card")
-        weights_layout = QVBoxLayout(weights_card)
-        weights_layout.setContentsMargins(12, 10, 12, 10)
-        weights_layout.addWidget(weights_label)
-        weights_layout.addWidget(self._relevance_label)
-        weights_layout.addWidget(self._relevance_slider)
-        weights_layout.addWidget(self._attainability_label)
-        weights_layout.addWidget(self._attainability_slider)
-        weights_layout.addWidget(self._recency_label)
-        weights_layout.addWidget(self._recency_slider)
-        layout.addWidget(weights_card)
+        # Status Card
+        status_card = QFrame()
+        status_card.setProperty("role", "card")
+        status_layout = QVBoxLayout(status_card)
+        status_layout.setContentsMargins(12, 10, 12, 10)
+        status_title = QLabel("Status")
+        status_title.setObjectName("cardTitle")
+        status_layout.addWidget(status_title)
+        status_form = QFormLayout()
+        status_form.addRow("Last Save Status", self._settings_status_value)
+        status_layout.addLayout(status_form)
+        layout.addWidget(status_card)
 
         controls = QHBoxLayout()
         self._settings_reload_button.clicked.connect(self._reload_settings_clicked)
@@ -761,7 +1032,7 @@ class JobPipeMainWindow(QMainWindow):
         self._cv_path_label = QLabel(f"CV Path: {self._service.settings.master_cv_path}")
         layout.addWidget(self._cv_path_label)
 
-        # Editor and preview split
+        # Editor and preview split (horizontal for side-by-side view)
         split_view = QSplitter(Qt.Orientation.Horizontal)
 
         # Editor
@@ -904,31 +1175,38 @@ class JobPipeMainWindow(QMainWindow):
     def _build_resume_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
 
         self._resume_job_id_input.setPlaceholderText("Optional explicit job id")
-        self._resume_min_score_input.setPlaceholderText("Defaults to notification threshold")
-        self._resume_min_score_input.setText(f"{self._service.settings.notification_threshold:.2f}")
         self._resume_tex_path_input.setText(str(self._service.default_resume_tex_path()))
+
+        # Use horizontal splitter for side-by-side layout
+        horiz_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left panel: form and workflow
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
 
         form = QFormLayout()
         form.addRow("Job ID", self._resume_job_id_input)
-        form.addRow("Minimum Score", self._resume_min_score_input)
         form.addRow("Staged Markdown Path", self._resume_output_path_value)
         form.addRow("TeX Path", self._resume_tex_path_input)
         form.addRow("Status", self._resume_status_value)
         form_card = QFrame()
         form_card.setProperty("role", "card")
         form_layout = QVBoxLayout(form_card)
-        form_layout.setContentsMargins(12, 8, 12, 8)
+        form_layout.setContentsMargins(8, 6, 8, 6)
         form_layout.addLayout(form)
-        layout.addWidget(form_card)
+        left_layout.addWidget(form_card)
 
         # Quick AI Generation panel
         ai_card = QFrame()
         ai_card.setProperty("role", "card")
         ai_layout = QVBoxLayout(ai_card)
-        ai_layout.setContentsMargins(12, 8, 12, 8)
+        ai_layout.setContentsMargins(8, 6, 8, 6)
+        ai_layout.setSpacing(4)
         ai_title = QLabel("AI Resume Generation (Phase C)")
         ai_title.setObjectName("cardTitle")
         ai_layout.addWidget(ai_title)
@@ -938,6 +1216,7 @@ class JobPipeMainWindow(QMainWindow):
         ai_layout.addWidget(ai_desc)
 
         ai_buttons = QHBoxLayout()
+        ai_buttons.setSpacing(4)
         self._resume_gen_1page_button.setObjectName("primaryButton")
         self._resume_gen_1page_button.clicked.connect(lambda: self._resume_generate_ai_clicked("1"))
         ai_buttons.addWidget(self._resume_gen_1page_button)
@@ -947,31 +1226,84 @@ class JobPipeMainWindow(QMainWindow):
 
         ai_buttons.addStretch(1)
         ai_layout.addLayout(ai_buttons)
-        layout.addWidget(ai_card)
+        left_layout.addWidget(ai_card)
 
-        controls = QHBoxLayout()
-        self._resume_stage_button.clicked.connect(self._resume_stage_clicked)
-        self._resume_compile_button.clicked.connect(self._resume_compile_clicked)
-        self._resume_open_pdf_button.clicked.connect(self._resume_open_pdf_clicked)
+        # Workflow section with step labels
+        workflow_label = QLabel("Resume Workflow:")
+        workflow_label.setObjectName("cardTitle")
+        left_layout.addWidget(workflow_label)
+        
+        # Step 1: Stage
+        step1_layout = QHBoxLayout()
+        step1_layout.setSpacing(4)
+        step1_label = QLabel("1. Stage Job Description")
+        step1_label.setProperty("role", "formLabel")
+        step1_layout.addWidget(step1_label)
+        step1_layout.addStretch(1)
         self._resume_stage_button.setObjectName("primaryButton")
+        self._resume_stage_button.clicked.connect(self._resume_stage_clicked)
+        step1_layout.addWidget(self._resume_stage_button)
+        left_layout.addLayout(step1_layout)
+
+        # Step 2: Review & Compile
+        step2_layout = QHBoxLayout()
+        step2_layout.setSpacing(4)
+        step2_label = QLabel("2. Review LaTeX & Compile")
+        step2_label.setProperty("role", "formLabel")
+        step2_layout.addWidget(step2_label)
+        step2_layout.addStretch(1)
+        self._resume_compile_button.clicked.connect(self._resume_compile_clicked)
+        step2_layout.addWidget(self._resume_compile_button)
         self._resume_approve_button.setObjectName("primaryButton")
-        controls.addWidget(self._resume_stage_button)
-        controls.addWidget(self._resume_compile_button)
-        controls.addWidget(self._resume_approve_button)  # REQ-3.4
-        controls.addWidget(self._resume_open_pdf_button)
-        controls.addStretch(1)
-        layout.addLayout(controls)
+        self._resume_approve_button.clicked.connect(self._resume_approve_clicked)
+        step2_layout.addWidget(self._resume_approve_button)
+        left_layout.addLayout(step2_layout)
+
+        # Step 3: View Result
+        step3_layout = QHBoxLayout()
+        step3_layout.setSpacing(4)
+        step3_label = QLabel("3. View Result")
+        step3_label.setProperty("role", "formLabel")
+        step3_layout.addWidget(step3_label)
+        step3_layout.addStretch(1)
+        self._resume_open_pdf_button.clicked.connect(self._resume_open_pdf_clicked)
+        step3_layout.addWidget(self._resume_open_pdf_button)
+        left_layout.addLayout(step3_layout)
+
+        # Job details section (scrollable, shows what will be fed to AI)
+        job_details_group = QGroupBox("Job Details for AI")
+        job_details_layout = QVBoxLayout(job_details_group)
+        job_details_layout.setContentsMargins(8, 6, 8, 6)
+        
+        self._resume_job_details_text = QPlainTextEdit()
+        self._resume_job_details_text.setReadOnly(True)
+        self._resume_job_details_text.setPlaceholderText("Job details will appear here when a job is staged or selected...")
+        self._resume_job_details_text.setMaximumHeight(300)
+        job_details_layout.addWidget(self._resume_job_details_text)
+        left_layout.addWidget(job_details_group)
 
         # Job context info (populated when staging or generating)
         self._resume_context_label = QLabel("No job selected")
         self._resume_context_label.setProperty("role", "muted")
-        layout.addWidget(self._resume_context_label)
+        left_layout.addWidget(self._resume_context_label)
+        left_layout.addStretch(1)
 
-        # LaTeX editor (REQ-3.3)
+        horiz_splitter.addWidget(left_panel)
+
+        # Right panel: LaTeX editor (REQ-3.3)
         editor_label = QLabel("LaTeX Resume Editor:")
         editor_label.setObjectName("cardTitle")
-        layout.addWidget(editor_label)
-        layout.addWidget(self._resume_preview)
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(editor_label)
+        right_layout.addWidget(self._resume_preview)
+        horiz_splitter.addWidget(right_panel)
+        
+        horiz_splitter.setStretchFactor(0, 1)
+        horiz_splitter.setStretchFactor(1, 1)
+        
+        layout.addWidget(horiz_splitter)
         return widget
 
     def _build_logs_tab(self) -> QWidget:
@@ -1020,6 +1352,69 @@ class JobPipeMainWindow(QMainWindow):
             self._append_log(f"Ingest server failed to start: {exc}")
             QMessageBox.warning(self, "Ingest Server", str(exc))
 
+    def _filter_jobs_list(self, jobs: list) -> list:
+        """Apply sidebar filters to the jobs list (client-side)."""
+        filtered = []
+        # Build set of allowed seniority levels
+        allowed = set()
+        if self._filter_seniority_entry.isChecked():
+            allowed.update({"entry", "junior"})
+        if self._filter_seniority_mid.isChecked():
+            allowed.add("mid")
+        if self._filter_seniority_senior.isChecked():
+            allowed.update({"senior", "staff", "principal", "lead", "architect"})
+        if self._filter_seniority_manager.isChecked():
+            allowed.add("manager")
+
+        min_total = self._filter_min_total.value() / 100.0
+        min_relevance = self._filter_min_relevance.value() / 100.0
+        min_attainability = self._filter_min_attainability.value() / 100.0
+        
+        # Age filter
+        reject_old = self._filter_reject_old_jobs.isChecked()
+        max_age_days = self._filter_max_job_age.value()
+        from datetime import datetime, timedelta, timezone
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+
+        for job in jobs:
+            # Seniority filter
+            seniority = _infer_seniority_hint(job.title, job.description or "")
+            if seniority not in allowed:
+                continue
+            
+            # Age filter (only apply if reject_old is enabled)
+            if reject_old and job.date_posted:
+                job_date = job.date_posted
+                # Ensure both datetimes are offset-aware (UTC)
+                if job_date.tzinfo is None:
+                    job_date = job_date.replace(tzinfo=timezone.utc)
+                if job_date < cutoff_date:
+                    continue  # Skip old jobs
+            
+            # Score filters (0 = no filter) — safely convert to float
+            def _safe_float(val):
+                if val is None:
+                    return None
+                if isinstance(val, float):
+                    return val
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    return None
+            
+            job_total = _safe_float(job.match_score)
+            job_rel = _safe_float(job.score_relevance)
+            job_attain = _safe_float(job.score_attainability)
+            
+            if min_total > 0 and (job_total is None or job_total < min_total):
+                continue
+            if min_relevance > 0 and (job_rel is None or job_rel < min_relevance):
+                continue
+            if min_attainability > 0 and (job_attain is None or job_attain < min_attainability):
+                continue
+            filtered.append(job)
+        return filtered
+
     def refresh_views(self) -> None:
         try:
             snapshot = self._service.dashboard_snapshot()
@@ -1028,6 +1423,9 @@ class JobPipeMainWindow(QMainWindow):
                 limit=self._jobs_limit_input.value(),
                 search_query=search_query,
             )
+            # Apply sidebar filters (client-side, opt-in)
+            jobs = self._filter_jobs_list(jobs)
+
             runs = self._service.list_recent_runs(limit=200)
             notifications = self._service.list_recent_notifications(limit=200)
             job_count, company_count = self._service.get_jobs_and_companies_count()
@@ -1094,26 +1492,29 @@ class JobPipeMainWindow(QMainWindow):
         for row, job in enumerate(jobs):
             # Build posted display: prefer posted_ago (e.g., "2 hours ago") with date_posted as tooltip
             posted_display = job.posted_ago or _format_datetime(job.date_posted)
+            # Infer seniority from title+description
+            seniority = _infer_seniority_hint(job.title, job.description or "")
             
             values = [
-                _format_score(job.match_score),  # Total
-                _format_score(job.score_relevance),  # Relevance
-                _format_score(job.score_attainability),  # Attainability
-                _format_score(job.score_recency),  # Recency
-                job.title,
-                job.company,
-                job.platform,
-                job.status,
-                posted_display,
-                job.url,
+                _format_score(job.match_score),  # Total (col 0)
+                _format_score(job.score_relevance),  # Relevance (col 1)
+                _format_score(job.score_attainability),  # Attainability (col 2)
+                _format_score(job.score_recency),  # Recency (col 3)
+                seniority.capitalize(),  # Seniority (col 4)
+                job.title,  # Title (col 5)
+                job.company,  # Company (col 6)
+                job.platform,  # Platform (col 7)
+                job.status,  # Status (col 8)
+                posted_display,  # Posted (col 9)
+                job.url,  # URL (col 10)
             ]
             for column, text in enumerate(values):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                if column == 4:
+                if column == 5:  # Title column stores job.id
                     item.setData(Qt.ItemDataRole.UserRole, job.id)
                 # Add tooltip with full date if using posted_ago
-                if column == 8 and job.posted_ago:  # Posted column
+                if column == 9 and job.posted_ago:  # Posted column
                     item.setToolTip(_format_datetime(job.date_posted))
                 # Add tooltip for score columns showing "Why this score?"
                 if column in [0, 1, 2, 3] and text != "n/a":
@@ -1125,6 +1526,78 @@ class JobPipeMainWindow(QMainWindow):
         self._jobs_table.setSortingEnabled(True)
         # Sort by Total score (column 0) descending by default
         self._jobs_table.sortItems(0, Qt.SortOrder.DescendingOrder)
+
+    def _apply_job_filters(self) -> None:
+        """Apply search + sidebar filters and refresh the jobs view."""
+        # Update settings with sidebar values for scoring weights and preferences
+        # This ensures the service uses these values when scoring
+        try:
+            # Update scoring weights in settings
+            self._service.settings.notification_threshold = float(self._filter_notification_threshold.text() or "0.80")
+            self._service.settings.user_years_experience = int(self._filter_user_years.text() or "1")
+            self._service.settings.critical_skills = self._filter_critical_skills.text() or "python,fastapi,sql,aws"
+            self._service.settings.reject_terms = self._filter_reject_terms.text() or "senior,staff,principal,architect"
+            self._service.settings.auto_stage_job_description = self._filter_auto_stage.isChecked()
+            
+            # Note: Scoring weights would need to be passed to the scoring function
+            # For now, they're used in the filter display only
+        except (ValueError, TypeError) as exc:
+            self._append_log(f"Filter validation error: {exc}")
+        
+        self.refresh_views()
+
+    def _reset_job_filters(self) -> None:
+        """Reset all sidebar filters to defaults (show all)."""
+        self._filter_seniority_entry.setChecked(True)
+        self._filter_seniority_mid.setChecked(True)
+        self._filter_seniority_senior.setChecked(True)
+        self._filter_seniority_manager.setChecked(True)
+        self._filter_min_total.setValue(0)
+        self._filter_min_relevance.setValue(0)
+        self._filter_min_attainability.setValue(0)
+        
+        # Reset job preferences to minimal defaults
+        self._filter_notification_threshold.setText("0.80")
+        self._filter_user_years.setText("1")
+        self._filter_critical_skills.clear()
+        self._filter_reject_terms.clear()
+        self._filter_auto_stage.setChecked(False)
+        
+        # Reset scoring weights
+        self._filter_relevance_slider.setValue(50)
+        self._filter_attainability_slider.setValue(30)
+        self._filter_recency_slider.setValue(20)
+        
+        # Reset age filter to minimal (disabled)
+        self._filter_reject_old_jobs.setChecked(False)
+        self._filter_max_job_age.setValue(30)
+        
+        self._jobs_search_input.clear()
+        self.refresh_views()
+
+    def _recalculate_scores_clicked(self) -> None:
+        """Recalculate all job scores using current Master CV."""
+        reply = QMessageBox.question(
+            self,
+            "Recalculate Scores",
+            "Recalculate scores for ALL jobs using the current Master CV?\n\nThis will reset and recompute relevance, attainability, and recency scores.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        def do_rescore() -> int:
+            return self._service.rescore_all_jobs()
+
+        self._resume_busy = True  # reuse resume busy flag for UI disable
+        self.statusBar().showMessage("Recalculating scores...")
+        self._append_log("Recalculating all job scores...")
+
+        worker = BackgroundActionWorker(fn=do_rescore)
+        worker.signals.succeeded.connect(self._on_rescore_complete)
+        worker.signals.failed.connect(lambda err: self._append_log(f"Rescore failed: {err}"))
+        worker.signals.completed.connect(lambda: setattr(self, '_resume_busy', False))
+        self._thread_pool.start(worker)
 
     def _populate_runs(self, runs: list) -> None:
         self._runs_table.setSortingEnabled(False)
@@ -1181,7 +1654,7 @@ class JobPipeMainWindow(QMainWindow):
             return
 
         row = selected[0].row()
-        url_item = self._jobs_table.item(row, 9)
+        url_item = self._jobs_table.item(row, 10)  # URL column
         if url_item is None:
             QMessageBox.warning(self, "Missing URL", "Selected row has no URL.")
             return
@@ -1197,13 +1670,76 @@ class JobPipeMainWindow(QMainWindow):
             return
 
         # Start enrichment polling for this job
-        title_item = self._jobs_table.item(row, 4)
+        title_item = self._jobs_table.item(row, 5)  # Title column
         if title_item:
             job_id = title_item.data(Qt.ItemDataRole.UserRole)
             if job_id:
                 self._start_enrichment_polling(str(job_id), row)
 
         self._append_log(f"Opened URL: {url}, monitoring enrichment...")
+
+    def _on_job_double_clicked(self, item: QTableWidgetItem) -> None:
+        """Handle double-click on job table: open URL, start enrichment polling, and auto-stage for resume."""
+        row = item.row()
+        
+        # Get job details from table
+        url_item = self._jobs_table.item(row, 10)  # URL column
+        title_item = self._jobs_table.item(row, 5)  # Title column
+        company_item = self._jobs_table.item(row, 6)  # Company column
+        
+        if not url_item or not title_item:
+            self._append_log("Double-click: Missing URL or title item")
+            return
+        
+        url = url_item.text().strip()
+        title = title_item.text().strip()
+        company = company_item.text().strip() if company_item else "Unknown"
+        
+        # Get job_id from the title item's UserRole data
+        job_id = title_item.data(Qt.ItemDataRole.UserRole)
+        if not job_id:
+            self._append_log("Double-click: No job_id found for job")
+            # Try to get job_id from the service using title+company
+            try:
+                jobs = self._service.list_jobs(limit=5000)
+                for job in jobs:
+                    if job.title == title and job.company == company:
+                        job_id = job.id
+                        self._append_log(f"Double-click: Found job_id by title+company: {job_id}")
+                        break
+            except Exception as exc:
+                self._append_log(f"Double-click: Error finding job_id: {exc}")
+            
+        if not job_id:
+            self._append_log("Double-click: Could not determine job_id")
+            return
+        
+        self._append_log(f"Double-click: job_id={job_id}, title={title}, company={company}")
+        
+        # Open URL if available
+        if url:
+            opened = QDesktopServices.openUrl(QUrl(url))
+            if opened:
+                self._append_log(f"Double-click opened URL: {url}")
+                # Start enrichment polling to monitor auto-scrape from the job page
+                self._start_enrichment_polling(str(job_id), row)
+            else:
+                self._append_log(f"Double-click: Failed to open URL: {url}")
+        
+        # Switch to Resume tab
+        tabs = self.findChild(QTabWidget, "mainTabs")
+        if tabs:
+            for i in range(tabs.count()):
+                if "Resume" in tabs.tabText(i) and "Variant" not in tabs.tabText(i):
+                    tabs.setCurrentIndex(i)
+                    break
+        
+        # Pre-populate the job ID field
+        self._resume_job_id_input.setText(str(job_id))
+        
+        # DON'T stage immediately - wait for enrichment to complete
+        # The staging will happen in _on_enrichment_detected() if flag is set
+        self._append_log(f"Waiting for enrichment before staging resume for: {title} at {company}")
 
     def _copy_selected_jobs(self) -> None:
         """Copy selected jobs to clipboard as tab-separated values."""
@@ -1239,10 +1775,10 @@ class JobPipeMainWindow(QMainWindow):
         row = selected[0].row()
         details = []
         
-        # Get basic info from table
-        title_item = self._jobs_table.item(row, 4)  # Title column
-        company_item = self._jobs_table.item(row, 5)  # Company column
-        url_item = self._jobs_table.item(row, 9)  # URL column
+        # Get basic info from table (Title=5, Company=6, URL=10)
+        title_item = self._jobs_table.item(row, 5)  # Title column
+        company_item = self._jobs_table.item(row, 6)  # Company column
+        url_item = self._jobs_table.item(row, 10)  # URL column
         
         if title_item:
             details.append(f"Title: {title_item.text()}")
@@ -1321,8 +1857,13 @@ class JobPipeMainWindow(QMainWindow):
         try:
             enriched = self._service.poll_job_enrichment(self._enrichment_job_id)
             if enriched:
+                self._append_log(f"Enrichment detected for job {self._enrichment_job_id}")
                 self._on_enrichment_detected()
                 return
+            else:
+                # Log progress for debugging
+                if self._enrichment_poll_count % 5 == 0:  # Every 10 seconds
+                    self._append_log(f"Still waiting for enrichment... (poll {self._enrichment_poll_count}/{self._enrichment_poll_max})")
         except Exception as exc:
             self._append_log(f"Enrichment poll error: {exc}")
 
@@ -1355,6 +1896,13 @@ class JobPipeMainWindow(QMainWindow):
         self._append_log(f"Job {self._enrichment_job_id} enriched successfully!")
         self.statusBar().showMessage("Job data enriched from detail page ✓", 5000)
         self.refresh_views()
+        
+        # Auto-stage resume if flag is set (from double-click)
+        if self._pending_stage_after_enrichment:
+            self._pending_stage_after_enrichment = False
+            self._append_log("Auto-staging resume after enrichment...")
+            self._resume_stage_clicked()
+        
         self._enrichment_job_id = None
         self._enrichment_job_row = None
 
@@ -1368,8 +1916,8 @@ class JobPipeMainWindow(QMainWindow):
             return
 
         row = selected[0].row()
-        title_item = self._jobs_table.item(row, 4)
-        company_item = self._jobs_table.item(row, 5)
+        title_item = self._jobs_table.item(row, 5)  # Title column
+        company_item = self._jobs_table.item(row, 6)  # Company column
         if not title_item:
             QMessageBox.warning(self, "Missing Data", "Selected row has no job data.")
             return
@@ -1393,6 +1941,9 @@ class JobPipeMainWindow(QMainWindow):
 
         # Pre-populate the job ID field
         self._resume_job_id_input.setText(str(job_id))
+        
+        # Update job details section
+        self._update_resume_job_details(str(job_id))
 
         # Auto-stage the job description
         self._append_log(f"Generating resume for: {title} at {company} (job_id={job_id})")
@@ -1481,7 +2032,7 @@ class JobPipeMainWindow(QMainWindow):
             return
 
         row = selected[0].row()
-        title_item = self._jobs_table.item(row, 4)
+        title_item = self._jobs_table.item(row, 5)  # Title column
         if not title_item:
             return
 
@@ -1582,6 +2133,28 @@ class JobPipeMainWindow(QMainWindow):
             success_handler=self._resume_stage_succeeded,
         )
 
+    def _update_resume_job_details(self, job_id: str) -> None:
+        """Update the scrollable job details section with job information."""
+        try:
+            job = self._service.get_job_by_id(job_id)
+            if job:
+                details = []
+                details.append(f"Job ID: {job.id}")
+                details.append(f"Title: {job.title}")
+                details.append(f"Company: {job.company}")
+                details.append(f"Location: {job.location or 'N/A'}")
+                details.append(f"Platform: {job.platform}")
+                details.append(f"URL: {job.url}")
+                details.append(f"Match Score: {f'{job.match_score:.3f}' if job.match_score is not None else 'N/A'}")
+                details.append("")
+                details.append("Description:")
+                details.append(job.description or 'No description available')
+                self._resume_job_details_text.setPlainText('\n'.join(details))
+            else:
+                self._resume_job_details_text.setPlainText(f"Job {job_id} not found")
+        except Exception as exc:
+            self._resume_job_details_text.setPlainText(f"Error loading job details: {exc}")
+
     def _resume_approve_clicked(self) -> None:
         """Handle Approve & Compile button click (REQ-3.4).
 
@@ -1681,6 +2254,12 @@ class JobPipeMainWindow(QMainWindow):
         score_text = "n/a" if score is None else f"{score:.3f}"
         title = getattr(result, "title", "unknown")
         company = getattr(result, "company", "unknown")
+        job_id = getattr(result, "job_id", None)
+        
+        # Update job details section
+        if job_id:
+            self._update_resume_job_details(job_id)
+        
         self._resume_status_value.setText("Staged")
         self._resume_context_label.setText(f"Job: {title} at {company} | Score: {score_text}")
         self._append_log(
@@ -1713,10 +2292,10 @@ class JobPipeMainWindow(QMainWindow):
     def _collect_settings_form_values(self) -> dict[str, str]:
         return {
             "JOBPIPE_NOTIFICATION_THRESHOLD": (
-                self._settings_notification_threshold_input.text().strip()
+                self._filter_notification_threshold.text().strip()
             ),
             "JOBPIPE_USER_YEARS_EXPERIENCE": (
-                self._settings_user_years_input.text().strip()
+                self._filter_user_years.text().strip()
             ),
             "JOBPIPE_INGEST_HOST": self._settings_ingest_host_input.text().strip(),
             "JOBPIPE_INGEST_PORT": self._settings_ingest_port_input.text().strip(),
@@ -1724,20 +2303,20 @@ class JobPipeMainWindow(QMainWindow):
                 self._settings_ingest_payload_input.text().strip()
             ),
             "JOBPIPE_AUTO_STAGE_JOB_DESCRIPTION": str(
-                self._settings_auto_stage_checkbox.isChecked()
+                self._filter_auto_stage.isChecked()
             ).lower(),
-            "JOBPIPE_CRITICAL_SKILLS": self._settings_critical_skills_input.text().strip(),
-            "JOBPIPE_REJECT_TERMS": self._settings_reject_terms_input.text().strip(),
+            "JOBPIPE_CRITICAL_SKILLS": self._filter_critical_skills.text().strip(),
+            "JOBPIPE_REJECT_TERMS": self._filter_reject_terms.text().strip(),
         }
 
     def _set_settings_form_values(self, values: dict[str, str]) -> None:
         self._settings_env_path_value.setText(
             str(self._service.editable_env_file_path())
         )
-        self._settings_notification_threshold_input.setText(
+        self._filter_notification_threshold.setText(
             values.get("JOBPIPE_NOTIFICATION_THRESHOLD", "")
         )
-        self._settings_user_years_input.setText(
+        self._filter_user_years.setText(
             values.get("JOBPIPE_USER_YEARS_EXPERIENCE", "")
         )
         self._settings_ingest_host_input.setText(values.get("JOBPIPE_INGEST_HOST", ""))
@@ -1745,14 +2324,14 @@ class JobPipeMainWindow(QMainWindow):
         self._settings_ingest_payload_input.setText(
             values.get("JOBPIPE_INGEST_MAX_PAYLOAD_BYTES", "")
         )
-        self._settings_critical_skills_input.setText(
+        self._filter_critical_skills.setText(
             values.get("JOBPIPE_CRITICAL_SKILLS", "")
         )
-        self._settings_reject_terms_input.setText(
+        self._filter_reject_terms.setText(
             values.get("JOBPIPE_REJECT_TERMS", "")
         )
 
-        self._settings_auto_stage_checkbox.setChecked(
+        self._filter_auto_stage.setChecked(
             _is_truthy_env_value(values.get("JOBPIPE_AUTO_STAGE_JOB_DESCRIPTION", "false"))
         )
 
@@ -1803,21 +2382,27 @@ class JobPipeMainWindow(QMainWindow):
         filter_layout = QHBoxLayout()
 
         # Company filter
-        filter_layout.addWidget(QLabel("Company:"))
+        company_label = QLabel("Company:")
+        company_label.setProperty("role", "formLabel")
+        filter_layout.addWidget(company_label)
         self._variant_company_filter = QLineEdit()
         self._variant_company_filter.setPlaceholderText("Filter by company...")
         self._variant_company_filter.textChanged.connect(self._refresh_variants_table)
         filter_layout.addWidget(self._variant_company_filter)
 
         # Job type filter
-        filter_layout.addWidget(QLabel("Job Type:"))
+        jobtype_label = QLabel("Job Type:")
+        jobtype_label.setProperty("role", "formLabel")
+        filter_layout.addWidget(jobtype_label)
         self._variant_job_type_filter = QLineEdit()
         self._variant_job_type_filter.setPlaceholderText("Filter by job type...")
         self._variant_job_type_filter.textChanged.connect(self._refresh_variants_table)
         filter_layout.addWidget(self._variant_job_type_filter)
 
         # Page length filter
-        filter_layout.addWidget(QLabel("Pages:"))
+        pages_label = QLabel("Pages:")
+        pages_label.setProperty("role", "formLabel")
+        filter_layout.addWidget(pages_label)
         self._variant_page_length_filter = QLineEdit()
         self._variant_page_length_filter.setPlaceholderText("1 or 2")
         self._variant_page_length_filter.textChanged.connect(self._refresh_variants_table)

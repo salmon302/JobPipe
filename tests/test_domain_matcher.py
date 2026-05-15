@@ -112,7 +112,7 @@ def test_domain_alignment_no_cv_domains() -> None:
         "Building backend systems",
         cv,
     )
-    assert score == 0.5
+    assert score == 0.3  # Penalty for no CV domains and job domain not in CV text
 
 
 def test_domain_alignment_no_job_domain() -> None:

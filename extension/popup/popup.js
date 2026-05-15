@@ -58,6 +58,8 @@ const scrapeStatusCard = document.getElementById('scrapeStatusCard');
 const scrapeStatusEl = document.getElementById('scrapeStatus');
 const jobsFoundEl = document.getElementById('jobsFound');
 const jobsSentEl = document.getElementById('jobsSent');
+const excludeBtn = document.getElementById('excludeBtn');
+const includeBtn = document.getElementById('includeBtn');
 
 // Initialize popup
 document.addEventListener('DOMContentLoaded', async () => {
@@ -112,26 +114,69 @@ async function checkCurrentPage() {
 
     if (!tab || !tab.url) {
       pageStatusEl.textContent = 'No page detected';
+      excludeBtn.style.display = 'none';
+      includeBtn.style.display = 'none';
       return;
     }
 
     const url = new URL(tab.url);
     const hostname = url.hostname.toLowerCase();
 
+    let isKnownSite = false;
     if (hostname.includes('hiring.cafe')) {
       pageStatusEl.textContent = 'HiringCafe ✓';
+      isKnownSite = true;
     } else if (hostname.includes('linkedin.com')) {
       pageStatusEl.textContent = 'LinkedIn ✓';
+      isKnownSite = true;
     } else if (hostname.includes('builtin.com')) {
       pageStatusEl.textContent = 'Built In ✓';
+      isKnownSite = true;
     } else if (hostname.includes('wellfound.com')) {
       pageStatusEl.textContent = 'WellFound ✓';
+      isKnownSite = true;
     } else {
-      pageStatusEl.textContent = 'Unsupported site';
+      pageStatusEl.textContent = 'Generic site';
+    }
+
+    // Check if this site is excluded (not a job board)
+    const isExcluded = await checkIfExcluded(tab.id, hostname);
+
+    if (isExcluded) {
+      pageStatusEl.textContent += ' (Excluded)';
+      excludeBtn.style.display = 'none';
+      includeBtn.style.display = 'block';
+      captureBtn.disabled = true;
+      captureBatchBtn.disabled = true;
+    } else if (!isKnownSite) {
+      // Show exclude button for generic sites
+      excludeBtn.style.display = 'block';
+      includeBtn.style.display = 'none';
+    } else {
+      // Known sites - hide both buttons
+      excludeBtn.style.display = 'none';
+      includeBtn.style.display = 'none';
     }
   } catch (error) {
     pageStatusEl.textContent = 'Error checking page';
     console.error('Error checking current page:', error);
+    excludeBtn.style.display = 'none';
+    includeBtn.style.display = 'none';
+  }
+}
+
+async function checkIfExcluded(tabId, hostname) {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, { action: 'CHECK_EXCLUDED' });
+    return response && response.excluded;
+  } catch (error) {
+    // Content script might not be ready, check storage directly
+    return new Promise((resolve) => {
+      chrome.storage.local.get(['excludedHosts'], (result) => {
+        const hosts = result.excludedHosts || [];
+        resolve(hosts.includes(hostname));
+      });
+    });
   }
 }
 
@@ -193,6 +238,42 @@ function setupEventListeners() {
       updateScrapeStatus(request);
     }
   });
+
+  // Exclude site button handler
+  excludeBtn.addEventListener('click', async () => {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.id) return;
+
+    chrome.tabs.sendMessage(tab.id, { action: 'EXCLUDE_SITE' }, (response) => {
+      if (response && response.success) {
+        showMessage('Site marked as not a job board', 'success');
+        // Update UI
+        pageStatusEl.textContent += ' (Excluded)';
+        excludeBtn.style.display = 'none';
+        includeBtn.style.display = 'block';
+        captureBtn.disabled = true;
+        captureBatchBtn.disabled = true;
+      }
+    });
+  });
+
+  // Include site button handler (unmark as not a job board)
+  includeBtn.addEventListener('click', async () => {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.id) return;
+
+    chrome.tabs.sendMessage(tab.id, { action: 'INCLUDE_SITE' }, (response) => {
+      if (response && response.success) {
+        showMessage('Site unmarked - will scrape as job board', 'success');
+        // Update UI
+        pageStatusEl.textContent = pageStatusEl.textContent.replace(' (Excluded)', '');
+        excludeBtn.style.display = 'block';
+        includeBtn.style.display = 'none';
+        captureBtn.disabled = false;
+        captureBatchBtn.disabled = false;
+      }
+    });
+  });
 }
 
 async function captureJob(captureBatch) {
@@ -212,12 +293,21 @@ async function captureJob(captureBatch) {
 
     // Check if content script is ready by sending a ping
     let contentScriptReady = false;
+    let isExcluded = false;
     try {
       const pingResponse = await chrome.tabs.sendMessage(tab.id, { action: 'PING' });
       contentScriptReady = pingResponse && pingResponse.success;
+      
+      // Also check if site is excluded
+      const excludeResponse = await chrome.tabs.sendMessage(tab.id, { action: 'CHECK_EXCLUDED' });
+      isExcluded = excludeResponse && excludeResponse.excluded;
     } catch (pingError) {
       console.log('JobPipe popup: Ping failed:', pingError.message);
       contentScriptReady = false;
+    }
+
+    if (isExcluded) {
+      throw new Error('This site is marked as not a job board. Click "Unmark" to enable capturing.');
     }
 
     if (!contentScriptReady) {

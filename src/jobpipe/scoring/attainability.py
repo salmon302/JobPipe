@@ -27,20 +27,14 @@ def should_discard_for_senior_role(
     required_years: Optional[int],
     user_years_experience: int = 1,
 ) -> bool:
-    """Graduated seniority check — no longer a hard discard.
+    """Experience-based filtering removed from pipeline.
 
-    Returns True only for extreme mismatches (gap > 5 years).
-    Otherwise returns False and the penalty is handled by _years_score.
+    This function is kept for backward compatibility but always returns False.
+    Experience filtering is now handled by the attainability score penalty
+    and user-controlled UI filters.
     """
-    if required_years is None:
-        return False
-
-    user_years = max(0, user_years_experience)
-    gap = required_years - user_years
-
-    # Only hard-discard if gap is extreme (> 5 years)
-    if gap > 5:
-        return True
+    # No longer hard-discard jobs based on experience
+    # Users can filter by years experience in the UI
     return False
 
 
@@ -112,7 +106,7 @@ def _extract_required_education(description: str) -> str | None:
 
 def attainability_score(
     required_years: Optional[int] = None,
-    user_years_experience: int = 1,
+    user_years_experience: int = 2,
     user_education: Optional[str] = None,
     required_education: Optional[str] = None,
     user_skills: Optional[list[str]] = None,
@@ -185,17 +179,17 @@ def attainability_score(
     remote_score = _remote_preference_score(effective_remote_pref, is_remote_job)
     details.append(f"Remote: {remote_score:.2f}")
 
-    # 5. Domain alignment score (10% weight) — new
+    # 5. Domain alignment score (20% weight) — increased to penalize mismatches
     domain_score = _domain_attainability_score(cv, job_title, job_description)
     details.append(f"Domain: {domain_score:.2f}")
 
-    # Weighted average
+    # Weighted average - increased domain weight to 20% to better filter unrelated jobs
     total = (
-        years_score * 0.40
+        years_score * 0.30
         + edu_score * 0.20
         + skill_score * 0.25
         + remote_score * 0.05
-        + domain_score * 0.10
+        + domain_score * 0.20
     )
     details_str = ", ".join(details)
 
