@@ -84,10 +84,8 @@ def _slugify(value: str) -> str:
 def _clean_company_name(raw: str) -> str:
     """Attempt to produce a readable company name from various inputs.
 
-    Handles cases where the extension sends:
-    - URL fragments/hostnames (e.g., "drhorton", "legence_studentportal_en-us")
-    - UUID-like strings
-    - Normal company names (passthrough)
+    Only transforms inputs that are clearly bad (UUIDs, URL fragments).
+    Passes through normal company names unchanged.
     """
     import uuid
 
@@ -100,11 +98,16 @@ def _clean_company_name(raw: str) -> str:
     except (ValueError, AttributeError):
         pass
 
+    # If it's a normal company name (has spaces, mixed case, reasonable length),
+    # pass through unchanged
+    if " " in text or any(c.isupper() for c in text if c.isalpha()):
+        if 2 < len(text) < 100:
+            return text
+
     # If it contains underscores and looks like a hostname fragment, try to clean it
     if "_" in text and any(kw in text.lower() for kw in ["portal", "student", "career", "jobs"]):
         # Extract the likely company part (first segment before common suffixes)
         parts = text.split("_")
-        # Take the first part that looks like a company name
         for part in parts:
             cleaned = re.sub(
                 r"(portal|student|career|jobs|en-us|en_us|www|com|net|org)\\b",
@@ -123,9 +126,9 @@ def _clean_company_name(raw: str) -> str:
     return text
 
 
-def _hash_job_id(platform: str, url: str) -> str:
+def _hash_job_id(url: str) -> str:
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
-    return f"{_slugify(platform)}-{digest}"
+    return f"job-{digest}"
 
 
 def _parse_relative_time(value: str, now: datetime) -> datetime | None:
@@ -207,12 +210,23 @@ def _compose_description(payload: dict[str, Any]) -> str:
 def _build_job_record(payload: dict[str, Any]) -> JobRecord:
     title = _require_text(payload, "title")
     company_raw = _require_text(payload, "company")
-    # Try to extract a better company name from URL if the provided one looks bad
-    company = _clean_company_name(company_raw)
+    # Pass through the company name unchanged unless it looks like a bad value
+    # (all-lowercase slug, UUID, etc.). Never overwrite a valid-looking name.
+    # A name with uppercase letters or spaces is likely a proper company name.
+    company = company_raw
+    has_uppercase = any(c.isupper() for c in company_raw)
+    is_lowercase_slug = re.match(r"^[a-z0-9_-]+$", company_raw) is not None
+    if (is_lowercase_slug or len(company_raw) < 3) and not has_uppercase:
+        # Only then try to clean it
+        cleaned = _clean_company_name(company_raw)
+        if cleaned != company_raw:
+            company = cleaned
     url = _require_text(payload, "url")
     
     # If company name still looks like a URL fragment, try extracting from URL
-    if re.match(r"^[a-z_0-9-]+$", company.lower()) and len(company) < 30:
+    # ONLY if the current company name is clearly bad (all lowercase, no uppercase letters)
+    has_uppercase = any(c.isupper() for c in company)
+    if not has_uppercase and len(company) < 30:
         # Try to extract company from URL hostname
         try:
             from urllib.parse import urlparse
@@ -232,12 +246,6 @@ def _build_job_record(payload: dict[str, Any]) -> JobRecord:
                         company = potential_company.title()
         except Exception:  # noqa: BLE001
             pass
-
-    platform = (
-        _optional_text(payload, "platform")
-        or _optional_text(payload, "source")
-        or "Extension"
-    )
     description = _optional_text(payload, "description") or _compose_description(payload)
     if not description:
         raise IngestPayloadError("description is required")
@@ -267,7 +275,15 @@ def _build_job_record(payload: dict[str, Any]) -> JobRecord:
 
     provided_id = _optional_text(payload, "id") or _optional_text(payload, "job_id")
     provided_id = provided_id or _optional_text(payload, "source_id")
-    job_id = provided_id or _hash_job_id(platform, url)
+    # Use URL-based hash as the stable ID — platform-agnostic so the same URL
+    # always maps to the same job record regardless of which platform sent it.
+    job_id = provided_id or _hash_job_id(url)
+
+    platform = (
+        _optional_text(payload, "platform")
+        or _optional_text(payload, "source")
+        or "Extension"
+    )
 
     return JobRecord(
         id=job_id,

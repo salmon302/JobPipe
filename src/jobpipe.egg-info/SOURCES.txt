@@ -30,8 +30,11 @@ src/jobpipe/resume/staging.py
 src/jobpipe/scoring/__init__.py
 src/jobpipe/scoring/attainability.py
 src/jobpipe/scoring/calculator.py
+src/jobpipe/scoring/cv_parser.py
+src/jobpipe/scoring/domain_matcher.py
 src/jobpipe/scoring/embeddings.py
 src/jobpipe/scoring/extractors.py
+src/jobpipe/scoring/keyword_scorer.py
 src/jobpipe/scoring/prefilter.py
 src/jobpipe/scoring/recency.py
 src/jobpipe/storage/__init__.py
@@ -44,12 +47,15 @@ tests/test_attainability.py
 tests/test_calculator.py
 tests/test_cli.py
 tests/test_config.py
+tests/test_cv_parser.py
 tests/test_db_migrations.py
+tests/test_domain_matcher.py
 tests/test_e2e_pipeline.py
 tests/test_e2e_simple.py
 tests/test_extractors.py
 tests/test_gemini_client.py
 tests/test_gui_services.py
+tests/test_keyword_scorer.py
 tests/test_latex_editor.py
 tests/test_pipeline_run_once.py
 tests/test_prefilter.py
@@ -57,4 +63,5 @@ tests/test_recency.py
 tests/test_repository.py
 tests/test_resume_service.py
 tests/test_resume_staging.py
+tests/test_resume_variants.py
 tests/test_windows_toast.py

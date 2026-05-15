@@ -2,6 +2,46 @@
 // Author: Seth Nenninger (Tencent: Hy3 preview Agent)
 // Timestamp: 2026-05-13T02:30:00Z
 
+// ==================== HELPER FUNCTIONS ====================
+
+/**
+ * Safely send a message from the background script.
+ * Handles "Extension context invalidated" errors gracefully.
+ * @param {Object} message - The message to send
+ * @param {Function} [callback] - Optional callback for response
+ * @returns {Promise|undefined} - Returns a promise if no callback, or undefined
+ */
+function safeSendMessage(message, callback) {
+  try {
+    if (chrome.runtime?.id) {
+      if (callback) {
+        chrome.runtime.sendMessage(message, callback);
+      } else {
+        return chrome.runtime.sendMessage(message).catch((error) => {
+          if (error.message?.includes('Extension context invalidated')) {
+            console.warn('JobPipe: Extension context invalidated:', error.message);
+          } else {
+            console.error('JobPipe: Error sending message:', error);
+          }
+          return Promise.resolve(undefined);
+        });
+      }
+    } else {
+      console.warn('JobPipe: Extension context invalidated, cannot send message:', message.action);
+      if (callback) callback(undefined);
+      return Promise.resolve(undefined);
+    }
+  } catch (error) {
+    if (error.message?.includes('Extension context invalidated')) {
+      console.warn('JobPipe: Extension context invalidated:', error.message);
+    } else {
+      console.error('JobPipe: Error sending message:', error);
+    }
+    if (callback) callback(undefined);
+    return Promise.resolve(undefined);
+  }
+}
+
 // Store for tracking sent jobs (prevent duplicates in session)
 // Note: This is session-based only. If server data is cleared,
 // you may need to reload the extension or the page to clear this cache.
@@ -10,6 +50,64 @@ let sentJobsCache = new Set();
 
 // Auto-scrape state
 let autoScrapeEnabled = false;
+
+// Track tabs that were created (potentially by "Open Selected Job" in the GUI).
+// QDesktopServices.openUrl() from an external process opens a new tab but does
+// NOT set openerTabId, so we track ALL new tab creations with a cleanup timeout.
+let openedTabIds = new Set();
+
+// Listen for all newly created tabs — catches tabs opened by
+// "Open Selected Job" (QDesktopServices.openUrl) from an external process.
+chrome.tabs.onCreated.addListener((tab) => {
+  console.log('JobPipe: New tab created', tab.id, tab.url);
+  openedTabIds.add(tab.id);
+  // Clean up after 30 seconds to avoid scraping stale/reloaded tabs
+  setTimeout(() => {
+    openedTabIds.delete(tab.id);
+  }, 30000);
+});
+
+// When a tab finishes loading, ONLY scrape if it was just created
+// (tracked via openedTabIds). Do NOT scrape all tabs with job-like URLs.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === 'complete' && openedTabIds.has(tabId)) {
+    console.log('JobPipe: Tab finished loading, attempting scrape:', tabId, tab.url);
+    openedTabIds.delete(tabId);
+
+    // Try to scrape; if content script isn't there, inject it dynamically
+    scrapeTabWithFallback(tabId);
+  }
+});
+
+function scrapeTabWithFallback(tabId) {
+  // Try to send scrape message to existing content script
+  chrome.tabs.sendMessage(tabId, { action: 'TRIGGER_SCRAPE' }, (response) => {
+    if (chrome.runtime.lastError) {
+      // Content script not found, inject it dynamically
+      console.log('JobPipe: Content script not found in tab', tabId, '- injecting dynamically');
+      chrome.scripting.executeScript({
+        target: { tabId: tabId },
+        files: ['content/content_script.js']
+      }).then(() => {
+        console.log('JobPipe: Content script injected into tab', tabId);
+        // Wait for script to initialize, then send scrape message
+        setTimeout(() => {
+          chrome.tabs.sendMessage(tabId, { action: 'TRIGGER_SCRAPE' }, (response) => {
+            if (chrome.runtime.lastError) {
+              console.log('JobPipe: Error after injection:', chrome.runtime.lastError.message);
+            } else {
+              console.log('JobPipe: Scrape triggered after injection', response);
+            }
+          });
+        }, 1000);
+      }).catch((error) => {
+        console.error('JobPipe: Failed to inject content script:', error);
+      });
+    } else {
+      console.log('JobPipe: Triggered scrape on tab', tabId, response);
+    }
+  });
+}
 
 // Single listener for all messages
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -30,6 +128,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  if (request.action === 'SEND_ENRICHED_TO_SERVER') {
+    handleSendEnrichedToServer(request.jobData, request.serverUrl, sendResponse);
+    return true;
+  }
+
   if (request.action === 'CONTENT_SCRIPT_READY') {
     console.log('Content script ready on tab:', sender.tab?.id);
     sendResponse({ success: true });
@@ -40,7 +143,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     autoScrapeEnabled = request.enabled;
     console.log('JobPipe: Auto-scrape set to', autoScrapeEnabled);
     // Broadcast to all popup listeners
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       action: 'SCRAPE_STATUS_UPDATE',
       status: autoScrapeEnabled ? 'Ready' : 'Disabled',
       jobsFound: 0,
@@ -54,7 +157,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.action === 'SCRAPE_STATUS_UPDATE') {
     // Forward status update to popup
-    chrome.runtime.sendMessage(request).catch(() => {
+    safeSendMessage(request).catch(() => {
       // No popup listening, ignore
     });
     sendResponse({ success: true });
@@ -131,7 +234,7 @@ async function handleSendToServer(jobData, serverUrl, sendResponse) {
     }
 
     // Broadcast status update to popup
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       action: 'SCRAPE_STATUS_UPDATE',
       status: result.status || 'completed',
       jobsFound: 1,
@@ -165,13 +268,14 @@ async function handleSendBatchToServer(jobs, serverUrl, sendResponse) {
     console.log('JobPipe: handleSendBatchToServer called with', jobs.length, 'jobs');
     console.log('JobPipe: Server URL:', serverUrl);
 
-    // Filter out duplicates
+    // Filter out duplicates — but allow enriched jobs through (they overwrite with fuller data)
     const uniqueJobs = [];
     const seen = new Set();
 
     for (const job of jobs) {
       const signature = `${job.platform}:${job.url}`;
-      if (!seen.has(signature) && !sentJobsCache.has(signature)) {
+      const isEnriched = job.enriched === true;
+      if (!seen.has(signature) && (isEnriched || !sentJobsCache.has(signature))) {
         seen.add(signature);
         uniqueJobs.push(job);
       }
@@ -179,6 +283,10 @@ async function handleSendBatchToServer(jobs, serverUrl, sendResponse) {
 
     console.log('JobPipe: Unique jobs after filtering:', uniqueJobs.length);
     console.log('JobPipe: Sample job IDs:', uniqueJobs.slice(0, 3).map(j => j.id || 'no-id'));
+    const enrichedCount = uniqueJobs.filter(j => j.enriched).length;
+    if (enrichedCount > 0) {
+      console.log(`JobPipe: ${enrichedCount} enriched jobs will overwrite existing records`);
+    }
 
     if (uniqueJobs.length === 0) {
       sendResponse({
@@ -246,7 +354,7 @@ async function handleSendBatchToServer(jobs, serverUrl, sendResponse) {
     }
 
     // Broadcast status update to popup
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       action: 'SCRAPE_STATUS_UPDATE',
       status: result.status || 'completed',
       jobsFound: uniqueJobs.length,
@@ -265,6 +373,97 @@ async function handleSendBatchToServer(jobs, serverUrl, sendResponse) {
   } catch (error) {
     console.error('Error sending batch to server:', error);
     showToastNotification(`✗ Error: ${error.message}`, true);
+    sendResponse({
+      success: false,
+      error: error.message,
+    });
+  }
+}
+
+/**
+ * Send enriched detail page data to JobPipe server (bypasses cache).
+ * This allows overwriting placeholder descriptions with full rich data.
+ */
+async function handleSendEnrichedToServer(jobData, serverUrl, sendResponse) {
+  try {
+    // Generate a stable job ID from the URL to match existing records
+    const platform = jobData.platform || 'HiringCafe';
+    const url = jobData.url || '';
+
+    // Extract job ID from URL path if available
+    let jobId = jobData.id;
+    if (!jobId && url.includes('/viewjob/')) {
+      const pathMatch = url.match(/\/viewjob\/([^/?]+)/);
+      if (pathMatch) {
+        jobId = `hiringcafe-${pathMatch[1]}`;
+      }
+    }
+
+    console.log('JobPipe: Sending enriched data for', jobId || url);
+
+    const payload = {
+      platform: platform,
+      id: jobId || null,
+      title: jobData.title,
+      company: jobData.company,
+      url: url,
+      description: jobData.description || '',
+      summary: jobData.summary || null,
+      requirements: jobData.requirements || null,
+      location: jobData.location || null,
+      compensation: jobData.compensation || null,
+      workplace_type: jobData.workplace_type || null,
+      employment_type: jobData.employment_type || null,
+      views: jobData.views ?? null,
+      saves: jobData.saves ?? null,
+      applications: jobData.applications ?? null,
+      posted_at: jobData.posted_at || null,
+      posted_ago: jobData.posted_ago || null,
+    };
+
+    const response = await fetch(`${serverUrl}/ingest`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+      mode: 'cors',
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Server returned ${response.status}: ${errorText}`);
+    }
+
+    const result = await response.json();
+
+    // Add to cache to prevent duplicate sends
+    if (jobId) {
+      sentJobsCache.add(`${platform}:${jobId}`);
+    } else {
+      sentJobsCache.add(`${platform}:${url}`);
+    }
+
+    console.log('JobPipe: Enriched data sent successfully');
+    showToastNotification(`✓ Enriched "${jobData.title}" with full description!`);
+
+    // Broadcast status update to popup
+    safeSendMessage({
+      action: 'SCRAPE_STATUS_UPDATE',
+      status: 'enriched',
+      jobsFound: 1,
+      jobsSent: 1,
+      message: `${jobData.title} enriched`,
+    }).catch(() => { /* No popup listening */ });
+
+    sendResponse({
+      success: true,
+      count: 1,
+      result: result,
+    });
+  } catch (error) {
+    console.error('Error sending enriched data:', error);
+    showToastNotification(`✗ Enrichment error: ${error.message}`, true);
     sendResponse({
       success: false,
       error: error.message,

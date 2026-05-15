@@ -86,7 +86,7 @@ class TestGeminiConfig(unittest.TestCase):
         """Test default configuration values."""
         config = GeminiConfig(api_key="test-key")
         self.assertEqual(config.api_key, "test-key")
-        self.assertEqual(config.model, "gemini-1.5-flash")
+        self.assertEqual(config.model, "gemini-flash-latest")
         self.assertIn("generativelanguage.googleapis.com", config.base_url)
         self.assertEqual(config.timeout_seconds, 60)
         self.assertEqual(config.max_retries, 3)

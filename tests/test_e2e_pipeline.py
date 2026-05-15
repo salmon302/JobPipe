@@ -91,7 +91,7 @@ class TestE2EPipeline(unittest.TestCase):
             run_lock_path=cls.test_root / "runtime" / "lock.lock",
             run_lock_stale_seconds=3600,
             gemini_api_key=None,  # No API key for e2e tests
-            gemini_model="gemini-1.5-flash",
+            gemini_model="gemini-flash-latest",
             gemini_base_url="https://generativelanguage.googleapis.com/v1beta",
             gemini_timeout_seconds=30,
             gemini_max_retries=1,
@@ -171,7 +171,7 @@ class TestE2EPipeline(unittest.TestCase):
             run_lock_path=self.test_root / "runtime" / "lock.lock",
             run_lock_stale_seconds=3600,
             gemini_api_key=None,
-            gemini_model="gemini-1.5-flash",
+            gemini_model="gemini-flash-latest",
             gemini_base_url="https://generativelanguage.googleapis.com/v1beta",
             gemini_timeout_seconds=30,
             gemini_max_retries=1,

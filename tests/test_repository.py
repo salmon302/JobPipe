@@ -52,6 +52,46 @@ def test_repository_upsert_and_fetch(tmp_path) -> None:
     assert top[0].score_recency == 0.80
 
 
+def test_repository_list_jobs_searches_full_dataset_and_includes_unscored(tmp_path) -> None:
+    db_path = tmp_path / "jobpipe.db"
+    initialize_database(db_path)
+
+    repo = JobRepository(db_path)
+    scored = JobRecord(
+        id="job-scored",
+        platform="HiringCafe",
+        title="Senior Python Engineer",
+        company="Acme",
+        url="https://example.com/scored",
+        description="Build APIs with Python and SQL",
+        date_posted=datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc),
+    )
+    unscored = JobRecord(
+        id="job-unscored",
+        platform="HiringCafe",
+        title="Data Platform Engineer",
+        company="Beta Labs",
+        url="https://example.com/unscored",
+        description="Python data pipelines and warehouse work",
+        date_posted=datetime(2026, 4, 11, 12, 0, tzinfo=timezone.utc),
+    )
+
+    repo.upsert_jobs([scored, unscored])
+    repo.update_scoring(
+        job_id=scored.id,
+        match_score=0.95,
+        years_required=3,
+        is_remote=True,
+        status="Queued",
+    )
+
+    results = repo.list_jobs(limit=10, search_query="python")
+
+    assert [job.id for job in results] == ["job-scored", "job-unscored"]
+    assert results[1].match_score is None
+    assert results[1].title == "Data Platform Engineer"
+
+
 def test_notification_queue_and_mark_notified(tmp_path) -> None:
     db_path = tmp_path / "jobpipe.db"
     initialize_database(db_path)

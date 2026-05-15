@@ -5,13 +5,17 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from jobpipe.config import InvalidSettingsError, Settings
+from jobpipe.storage.db import initialize_database
 from jobpipe.gui.services import JobPipeGuiService
+from jobpipe.storage.models import JobRecord
+from jobpipe.storage.repository import JobRepository
 
 
 def _settings(tmp_path, monkeypatch) -> Settings:
@@ -147,3 +151,42 @@ def test_compile_resume_delegates_with_config(monkeypatch, tmp_path) -> None:
     assert captured["tex_path"].name == "FocusedResume.tex"
     assert captured["output_pdf_path"].name == "FocusedResume.pdf"
     assert captured["config"].pdflatex_command == service.settings.resume_pdflatex_command
+
+
+def test_list_jobs_searches_and_returns_unscored_rows(monkeypatch, tmp_path) -> None:
+    service = JobPipeGuiService(_settings(tmp_path, monkeypatch))
+    initialize_database(service.settings.db_path)
+    repo = JobRepository(service.settings.db_path)
+
+    scored = JobRecord(
+        id="job-scored",
+        platform="HiringCafe",
+        title="Senior Python Engineer",
+        company="Acme",
+        url="https://example.com/scored",
+        description="Build APIs with Python and SQL",
+        date_posted=datetime(2026, 4, 10, 12, 0, tzinfo=timezone.utc),
+    )
+    unscored = JobRecord(
+        id="job-unscored",
+        platform="HiringCafe",
+        title="Data Platform Engineer",
+        company="Beta Labs",
+        url="https://example.com/unscored",
+        description="Python data pipelines and warehouse work",
+        date_posted=datetime(2026, 4, 11, 12, 0, tzinfo=timezone.utc),
+    )
+
+    repo.upsert_jobs([scored, unscored])
+    repo.update_scoring(
+        job_id=scored.id,
+        match_score=0.95,
+        years_required=3,
+        is_remote=True,
+        status="Queued",
+    )
+
+    results = service.list_jobs(limit=10, search_query="python")
+
+    assert [job.id for job in results] == ["job-scored", "job-unscored"]
+    assert service.get_job_by_id("job-unscored").title == "Data Platform Engineer"

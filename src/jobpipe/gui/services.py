@@ -13,7 +13,7 @@ from jobpipe.config import InvalidSettingsError, Settings
 from jobpipe.ingest.server import IngestServer, IngestServerConfig
 from jobpipe.ingest.service import JobIngestService
 from jobpipe.resume.compiler import LatexCompileConfig, LatexCompileResult, compile_latex
-from jobpipe.resume.staging import StagedJobDescription, stage_job_description
+from jobpipe.resume.staging import ResumeTargetNotFoundError, StagedJobDescription, stage_job_description
 from jobpipe.storage.db import connect, initialize_database
 from jobpipe.storage.models import JobRecord, NotificationAuditRecord, ScrapeRunRecord
 from jobpipe.storage.repository import JobRepository
@@ -117,6 +117,20 @@ class JobPipeGuiService:
         self._prepare()
         repository = self._repository()
         return repository.list_top_jobs(limit=limit)
+
+    def list_jobs(
+        self,
+        limit: int = 200,
+        search_query: str | None = None,
+    ) -> list[JobRecord]:
+        self._prepare()
+        repository = self._repository()
+        return repository.list_jobs(limit=limit, search_query=search_query)
+
+    def get_job_by_id(self, job_id: str) -> JobRecord | None:
+        self._prepare()
+        repository = self._repository()
+        return repository.get_job_by_id(job_id)
 
     def get_jobs_and_companies_count(self) -> tuple[int, int]:
         """Return (unique_job_count, unique_company_count)."""
@@ -580,3 +594,132 @@ class JobPipeGuiService:
         from jobpipe.resume.service import compute_master_cv_hash
 
         return compute_master_cv_hash(self._settings.master_cv_path)
+
+    # -------------------------------------------------------------------------
+    # Job Enrichment Polling
+    # -------------------------------------------------------------------------
+    def poll_job_enrichment(self, job_id: str) -> bool:
+        """Check if a job has been enriched with a substantive description.
+
+        After opening a job URL in the browser, the extension auto-scrapes
+        and enriches the detail page. This method checks if the description
+        is now >200 characters (indicating enrichment succeeded).
+
+        Args:
+            job_id: The job ID to check.
+
+        Returns:
+            True if the job has a substantive description, False otherwise.
+        """
+        self._prepare()
+        repository = self._repository()
+        job = repository.get_job_by_id(job_id)
+        if job is None:
+            return False
+        return bool(job.description and len(job.description.strip()) > 200)
+
+    # -------------------------------------------------------------------------
+    # AI Resume Generation (direct from GUI)
+    # -------------------------------------------------------------------------
+    def generate_resume_content(
+        self,
+        job_id: str,
+        max_pages: str = "1",
+    ) -> dict:
+        """Generate a targeted LaTeX resume for a specific job via Gemini API.
+
+        This is the full pipeline:
+        1. Stage the job description for the given job_id
+        2. Read Master CV
+        3. Call Gemini API to generate LaTeX
+        4. Save to output directory
+        5. Return paths to the generated files
+
+        Args:
+            job_id: The job ID to generate a resume for.
+            max_pages: "1" for one page, "half" for a compact half-page resume.
+
+        Returns:
+            Dict with 'tex_path', 'pdf_path', 'title', 'company', 'status'.
+
+        Raises:
+            RuntimeError: If Gemini key is not configured or generation fails.
+            ResumeTargetNotFoundError: If job is not found or not eligible.
+        """
+        from jobpipe.resume.gemini_client import (
+            GeminiAPIError,
+            create_gemini_client_from_settings,
+        )
+        from jobpipe.resume.service import (
+            ApprovalRequiredError,
+            write_targeted_resume,
+        )
+
+        self._prepare()
+        repository = self._repository()
+
+        # 1. Get the job record
+        job = repository.get_job_by_id(job_id)
+        if job is None:
+            raise ResumeTargetNotFoundError(f"Job not found: {job_id}")
+
+        # 2. Stage the job description to a markdown file
+        staged = stage_job_description(
+            repository=repository,
+            output_path=self._settings.job_description_path,
+            minimum_score=0.0,  # No score threshold for explicit job_id
+            job_id=job_id,
+        )
+
+        # 3. Read Master CV
+        if not self._settings.master_cv_path.exists():
+            raise FileNotFoundError(
+                f"Master CV not found at: {self._settings.master_cv_path}"
+            )
+        master_cv = self._settings.master_cv_path.read_text(encoding="utf-8")
+        if not master_cv.strip():
+            raise RuntimeError(f"Master CV is empty at: {self._settings.master_cv_path}")
+
+        # 4. Read the staged job description
+        job_description = staged.output_path.read_text(encoding="utf-8")
+
+        # 5. Call Gemini API
+        if not self._settings.gemini_api_key:
+            raise RuntimeError(
+                "Gemini API key not configured. Set JOBPIPE_GEMINI_API_KEY in .env"
+            )
+
+        client = create_gemini_client_from_settings(self._settings)
+        try:
+            response = client.generate_resume(
+                master_cv=master_cv,
+                job_description=job_description,
+                max_pages=max_pages,
+            )
+        except GeminiAPIError as exc:
+            raise RuntimeError(f"Gemini API error: {exc}") from exc
+
+        # 6. Determine output path with company/title directory structure
+        safe_company = "".join(c if c.isalnum() or c in " _-" else "_" for c in job.company).strip()
+        safe_title = "".join(c if c.isalnum() or c in " _-" else "_" for c in job.title).strip()
+        page_suffix = "_half" if max_pages == "half" else ""
+        output_dir = self._settings.resume_output_dir / f"{safe_company}_{safe_title[:40]}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        tex_filename = f"resume{page_suffix}.tex"
+        tex_path = output_dir / tex_filename
+
+        # 7. Save LaTeX to file
+        tex_path.write_text(response.text, encoding="utf-8")
+
+        # Update the resume tex_path input in settings
+        self._settings.resume_target_basename = tex_filename.replace(".tex", "")
+
+        return {
+            "tex_path": str(tex_path),
+            "title": job.title,
+            "company": job.company,
+            "job_id": job.id,
+            "status": "generated",
+            "message": f"Resume generated for {job.title} at {job.company}. Review and compile.",
+        }

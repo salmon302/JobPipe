@@ -7,6 +7,16 @@ from jobpipe.storage.db import connect
 from jobpipe.storage.models import JobRecord, NotificationAuditRecord, ScrapeRunRecord
 
 
+_JOB_SELECT_COLUMNS = """
+    jobs.id, jobs.platform, jobs.title, jobs.company, jobs.url, jobs.description, jobs.date_posted,
+    jobs.match_score, jobs.status, jobs.years_required, jobs.is_remote,
+    jobs.score_relevance, jobs.score_attainability, jobs.score_recency,
+    jobs.summary, jobs.requirements, jobs.location, jobs.county, jobs.compensation,
+    jobs.workplace_type, jobs.employment_type, jobs.department, jobs.team,
+    jobs.views, jobs.saves, jobs.applications, jobs.posted_at, jobs.posted_ago
+""".strip()
+
+
 class JobRepository:
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
@@ -230,6 +240,35 @@ class JobRepository:
                     chunk,
                 ).fetchall()
                 existing_ids.update(row["id"] for row in rows)
+
+            # URL-based dedup: check if any incoming job's URL already exists
+            # under a different ID (e.g., same job ingested from different platforms).
+            # When found, rewrite the incoming job's ID to match the existing record
+            # so ON CONFLICT(id) merges the data instead of inserting a duplicate.
+            incoming_urls = [(job.url, job.id) for job in jobs]
+            url_placeholders = ",".join("?" for _ in incoming_urls)
+            if incoming_urls:
+                # Build a mapping of URL -> existing ID
+                url_to_existing_id: dict[str, str] = {}
+                for chunk_urls in [incoming_urls[i:i+900] for i in range(0, len(incoming_urls), 900)]:
+                    chunk_placeholders = ",".join("?" for _ in chunk_urls)
+                    url_rows = conn.execute(
+                        f"SELECT id, url FROM jobs WHERE url IN ({chunk_placeholders})",
+                        [u[0] for u in chunk_urls],
+                    ).fetchall()
+                    for row in url_rows:
+                        url_to_existing_id[row["url"]] = row["id"]
+
+                # Rewrite IDs for jobs whose URL already exists under a different ID
+                for job in jobs:
+                    existing_id = url_to_existing_id.get(job.url)
+                    if existing_id is not None and existing_id != job.id:
+                        LOGGER.info(
+                            "upsert_jobs | URL dedup: %s -> %s (was %s)",
+                            job.url, existing_id, job.id,
+                        )
+                        job.id = existing_id
+                        existing_ids.add(existing_id)
 
             # If many IDs are already present, log a small sample of their URLs for debugging.
             if existing_ids:
@@ -501,6 +540,62 @@ class JobRepository:
                 """,
                 (limit,),
             ).fetchall()
+
+        return [JobRecord.from_row(row) for row in rows]
+
+    def get_job_by_id(self, job_id: str) -> JobRecord | None:
+        with connect(self._db_path) as conn:
+            row = conn.execute(
+                f"""
+                SELECT {_JOB_SELECT_COLUMNS}
+                FROM jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return JobRecord.from_row(row)
+
+    def list_jobs(self, limit: int = 200, search_query: str | None = None) -> list[JobRecord]:
+        search = (search_query or "").strip()
+
+        if search:
+            tokens = [token for token in search.split() if token]
+            if tokens:
+                fts_query = " AND ".join(
+                    f'"{token.replace("\"", "\"\"")}"' for token in tokens
+                )
+                query = f"""
+                    SELECT {_JOB_SELECT_COLUMNS}
+                    FROM jobs
+                    JOIN jobs_fts ON jobs_fts.rowid = jobs.rowid
+                    WHERE jobs_fts MATCH ?
+                    ORDER BY (jobs.match_score IS NULL), jobs.match_score DESC, jobs.date_posted DESC
+                    LIMIT ?
+                """
+                params = (fts_query, limit)
+            else:
+                query = f"""
+                    SELECT {_JOB_SELECT_COLUMNS}
+                    FROM jobs
+                    ORDER BY (jobs.match_score IS NULL), jobs.match_score DESC, jobs.date_posted DESC
+                    LIMIT ?
+                """
+                params = (limit,)
+        else:
+            query = f"""
+                SELECT {_JOB_SELECT_COLUMNS}
+                FROM jobs
+                ORDER BY (jobs.match_score IS NULL), jobs.match_score DESC, jobs.date_posted DESC
+                LIMIT ?
+            """
+            params = (limit,)
+
+        with connect(self._db_path) as conn:
+            rows = conn.execute(query, params).fetchall()
 
         return [JobRecord.from_row(row) for row in rows]
 

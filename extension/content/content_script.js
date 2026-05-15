@@ -2,6 +2,46 @@
 // Author: Seth Nenninger (Tencent: Hy3 preview Agent)
 // Timestamp: 2026-05-12T18:55:00Z
 
+// ==================== HELPER FUNCTIONS ====================
+
+/**
+ * Safely send a message to the extension background script.
+ * Handles "Extension context invalidated" errors gracefully.
+ * @param {Object} message - The message to send
+ * @param {Function} [callback] - Optional callback for response
+ * @returns {Promise|undefined} - Returns a promise if no callback, or undefined
+ */
+function safeSendMessage(message, callback) {
+  try {
+    if (chrome.runtime?.id) {
+      if (callback) {
+        chrome.runtime.sendMessage(message, callback);
+      } else {
+        return chrome.runtime.sendMessage(message).catch((error) => {
+          if (error.message?.includes('Extension context invalidated')) {
+            console.warn('JobPipe: Extension context invalidated:', error.message);
+          } else {
+            console.error('JobPipe: Error sending message:', error);
+          }
+          return Promise.resolve(undefined);
+        });
+      }
+    } else {
+      console.warn('JobPipe: Extension context invalidated, cannot send message:', message.action);
+      if (callback) callback(undefined);
+      return Promise.resolve(undefined);
+    }
+  } catch (error) {
+    if (error.message?.includes('Extension context invalidated')) {
+      console.warn('JobPipe: Extension context invalidated:', error.message);
+    } else {
+      console.error('JobPipe: Error sending message:', error);
+    }
+    if (callback) callback(undefined);
+    return Promise.resolve(undefined);
+  }
+}
+
 // ==================== EXTRACTOR FUNCTIONS (inlined for Manifest V3) ====================
 
 /**
@@ -152,34 +192,238 @@ function extractWellFound() {
 }
 
 /**
+ * Extract job data from UKG/UltiPro platform (rec.pro.ukg.net)
+ * Used by many enterprise companies for their career portals.
+ */
+function extractUKG() {
+  try {
+    // UKG/UltiPro detail page: OpportunityDetail?opportunityId=...
+    // Title is typically in an h1 or h2 with the job title
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('h2') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('[class*="job-title"]') ||
+                    document.querySelector('title');
+    
+    if (!titleEl) return null;
+    
+    let title = titleEl.textContent.trim();
+    // Clean up title (remove site name after | or -)
+    title = title.replace(/\s*[-|]\s*[^-|]+$/, '').trim();
+    if (!title || title.length < 2) return null;
+    
+    // Company: look for organization name in the page
+    let company = 'Unknown Company';
+    
+    // Strategy 1: Look for company name in breadcrumbs or header
+    const companyCandidates = [
+      // Breadcrumb links (common in UKG portals)
+      document.querySelector('nav[aria-label="Breadcrumb"] a:last-child'),
+      document.querySelector('[class*="breadcrumb"] a:last-child'),
+      document.querySelector('[class*="breadcrumb"] [class*="active"]'),
+      document.querySelector('[class*="organization"]'),
+      document.querySelector('[class*="company-name"]'),
+      document.querySelector('[class*="employer"]'),
+      // Meta tags
+      document.querySelector('meta[property="og:site_name"]'),
+      document.querySelector('meta[name="application-name"]'),
+    ];
+    for (const el of companyCandidates) {
+      if (el) {
+        const text = el.getAttribute('content') || el.textContent.trim();
+        if (text && text.length > 1 && text.length < 100 &&
+            !text.toLowerCase().includes('sign in') &&
+            !text.toLowerCase().includes('login') &&
+            !text.toLowerCase().includes('register')) {
+          company = text;
+          break;
+        }
+      }
+    }
+    
+    // Strategy 2: Extract from URL hostname
+    if (company === 'Unknown Company') {
+      // URL pattern: COM1506COMNI.rec.pro.ukg.net or similar
+      const hostname = window.location.hostname;
+      // Try to extract company code from subdomain
+      const subdomainMatch = hostname.match(/^([^.]+)\.rec\.pro\.ukg\.net/);
+      if (subdomainMatch) {
+        const code = subdomainMatch[1];
+        // Remove common suffixes like COMNI, COM, etc.
+        const cleaned = code.replace(/COMNI|COM|CORP|INC|LLC$/i, '');
+        if (cleaned && cleaned.length > 2) {
+          company = cleaned;
+        } else {
+          company = code;
+        }
+      }
+    }
+    
+    // Description: main content area
+    let description = '';
+    const descSelectors = [
+      '[class*="description"]',
+      '[class*="content"]',
+      '[class*="detail"]',
+      '[class*="body"]',
+      'article',
+      'main',
+      '[role="main"]',
+    ];
+    for (const sel of descSelectors) {
+      const el = document.querySelector(sel);
+      if (el && el.textContent.trim().length > 100) {
+        description = el.textContent.trim();
+        break;
+      }
+    }
+    
+    // Fallback: all body text
+    if (!description || description.length < 100) {
+      description = document.body?.textContent?.trim() || '';
+    }
+    
+    console.log(`JobPipe: UKG extracted - Title="${title}" Company="${company}" Desc=${description.length}chars`);
+    
+    return {
+      platform: 'UKG',
+      title: title,
+      company: company,
+      url: window.location.href,
+      description: description,
+    };
+  } catch (error) {
+    console.error('Error extracting UKG job:', error);
+    return null;
+  }
+}
+
+/**
  * Generic job extraction fallback
  */
 function extractGeneric() {
   try {
-    const titleEl = document.querySelector('h1') ||
-                    document.querySelector('[class*="title"]') ||
-                    document.querySelector('title');
+    // Try multiple strategies to find the job title
+    let title = null;
+    let company = 'Unknown Company';
+
+    // Strategy 1: Look for job title in common patterns
+    const titleSelectors = [
+      'h1[class*="title"]',
+      'h1[class*="job"]',
+      '.job-title',
+      '.posting-title',
+      '[data-testid="job-title"]',
+      'h1',
+      '.title',
+      '[class*="header"] h1',
+      'header h1'
+    ];
+
+    for (const selector of titleSelectors) {
+      const el = document.querySelector(selector);
+      if (el) {
+        const text = el.textContent.trim();
+        // Filter out common false positives
+        if (text && 
+            !text.toLowerCase().includes('share') &&
+            !text.toLowerCase().includes('login') &&
+            !text.toLowerCase().includes('sign in') &&
+            text.length > 3 && 
+            text.length < 200) {
+          title = text;
+          break;
+        }
+      }
+    }
+
+    // Strategy 2: Look in the page title (document.title)
+    if (!title && document.title) {
+      // Remove site name from title (common pattern: "Job Title | Company | Site")
+      const titleParts = document.title.split(/[|\-–—]/);
+      if (titleParts.length > 0) {
+        const candidate = titleParts[0].trim();
+        if (candidate.length > 3 && candidate.length < 200) {
+          title = candidate;
+        }
+      }
+    }
+
+    // Strategy 3: Look for common job title patterns in the page
+    if (!title) {
+      const pageText = document.body?.textContent || '';
+      // Look for text that looks like a job title (capitalized words, reasonable length)
+      const titleMatch = pageText.match(/\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,5})\s*(?:-|–|—|\|)/);
+      if (titleMatch) {
+        title = titleMatch[1].trim();
+      }
+    }
+
+    // Strategy 1: Look for company name — EXCLUDE nav/header/breadcrumb elements
+    const companySelectors = [
+      '[itemprop="hiringOrganization"]',
+      '[itemprop="name"]',
+      '[data-testid="company-name"]',
+      '[class*="company-name"]:not(nav *)',
+      '[class*="company"]:not(nav *):not(header *):not([class*="breadcrumb"]):not([class*="nav"])',
+      '[class*="employer"]:not(nav *):not(header *)',
+      'a[href*="/company"]:not(nav *)',
+    ];
+    
+    for (const selector of companySelectors) {
+      const el = document.querySelector(selector);
+      if (el) { 
+        const text = el.textContent.trim();
+        if (text && text.length > 1 && text.length < 100 &&
+            !text.toLowerCase().includes('sign in') &&
+            !text.toLowerCase().includes('login') &&
+            !text.toLowerCase().includes('register')) {
+          company = text;
+          break; 
+        }
+      }
+    }
+
+    // Strategy 2: Look in page title for company (after the job title)
+    if (company === 'Unknown Company' && document.title) {
+      const titleParts = document.title.split(/[|\-–—]/);
+      if (titleParts.length > 1) {
+        // Company is often the second part
+        const candidate = titleParts[1].trim();
+        if (candidate.length > 1 && candidate.length < 100) {
+          company = candidate;
+        }
+      }
+    }
+
+    // Strategy 3: Extract company from URL
+    if (company === 'Unknown Company') {
+      const hostname = window.location.hostname;
+      // Try to extract from hostname like "discovery-senior-living.oasisrecruit.com"
+      const match = hostname.match(/^([^.]+)\.(.+)$/);
+      if (match) {
+        const firstPart = match[1];
+        // Convert "discovery-senior-living" to "Discovery Senior Living"
+        company = firstPart
+          .split(/[-_]/)
+          .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+          .join(' ');
+      }
+    }
 
     const descriptionEl = document.querySelector('[class*="description"]') ||
                           document.querySelector('[class*="content"]') ||
                           document.querySelector('article') ||
                           document.querySelector('main');
 
-    if (!titleEl || !descriptionEl) return null;
-
-    let company = 'Unknown Company';
-    const companySelectors = [
-      '[class*="company"]', '[class*="employer"]',
-      'a[href*="/company"]', '[itemprop="hiringOrganization"]'
-    ];
-    for (const selector of companySelectors) {
-      const el = document.querySelector(selector);
-      if (el) { company = el.textContent.trim(); break; }
+    if (!title || !descriptionEl) {
+      console.log('JobPipe: Generic extraction failed - title:', title, 'description:', !!descriptionEl);
+      return null;
     }
 
     return {
       platform: 'Generic',
-      title: titleEl.textContent.trim(),
+      title: title,
       company: company,
       url: window.location.href,
       description: descriptionEl.textContent.trim(),
@@ -195,11 +439,85 @@ function extractGeneric() {
  */
 function extractJobData() {
   const hostname = window.location.hostname.toLowerCase();
+  const fullUrl = window.location.href.toLowerCase();
+
+  // Check for known job platforms first
   if (hostname.includes('hiring.cafe')) return extractHiringCafe();
   if (hostname.includes('linkedin.com')) return extractLinkedIn();
   if (hostname.includes('builtin.com')) return extractBuiltIn();
   if (hostname.includes('wellfound.com')) return extractWellFound();
+  
+  // Check for UKG/UltiPro platform (rec.pro.ukg.net)
+  if (hostname.includes('rec.pro.ukg.net') || hostname.includes('ukg.net')) {
+    console.log('JobPipe: Detected UKG/UltiPro platform, using specialized extraction');
+    return extractUKG();
+  }
+
+  // Check for oasisrecruit.com platform (used by Discovery Senior Living)
+  if (hostname.includes('oasisrecruit.com')) {
+    console.log('JobPipe: Detected OasisRecruit platform, using specialized extraction');
+    return extractOasisRecruit();
+  }
+
+  // Check for common job platform patterns in URL
+  if (fullUrl.includes('/job/') || fullUrl.includes('/jobs/')) {
+    console.log('JobPipe: Detected job URL pattern, using generic extraction with enhanced title detection');
+  }
+
   return extractGeneric();
+}
+
+/**
+ * Extract job data from OasisRecruit platform (used by Discovery Senior Living, etc.)
+ */
+function extractOasisRecruit() {
+  try {
+    // OasisRecruit specific selectors
+    const titleEl = document.querySelector('h1') ||
+                    document.querySelector('[class*="title"]') ||
+                    document.querySelector('[class*="job-title"]') ||
+                    document.querySelector('title');
+    
+    const descriptionEl = document.querySelector('[class*="description"]') ||
+                          document.querySelector('[class*="content"]') ||
+                          document.querySelector('article') ||
+                          document.querySelector('main');
+    
+    if (!titleEl || !descriptionEl) return null;
+    
+    let title = titleEl.textContent.trim();
+    // Clean up title (remove site name, etc.)
+    title = title.replace(/\s*[-|]\s*.*$/, '').trim();
+    
+    // Extract company from URL or page
+    let company = 'Unknown Company';
+    const companyEl = document.querySelector('[class*="company"]') ||
+                     document.querySelector('[class*="employer"]') ||
+                     document.querySelector('a[href*="/company"]');
+    if (companyEl) {
+      company = companyEl.textContent.trim();
+    } else {
+      // Try to extract from URL (e.g., discovery-senior-living.oasisrecruit.com)
+      const urlMatch = hostname.match(/^([^.]+)\.oasisrecruit\.com/);
+      if (urlMatch) {
+        company = urlMatch[1]
+          .split('-')
+          .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+          .join(' ');
+      }
+    }
+    
+    return {
+      platform: 'OasisRecruit',
+      title: title,
+      company: company,
+      url: window.location.href,
+      description: descriptionEl.textContent.trim(),
+    };
+  } catch (error) {
+    console.error('Error extracting OasisRecruit job:', error);
+    return null;
+  }
 }
 
 /**
@@ -418,7 +736,7 @@ function buildHiringCafeJobFromHit(hit) {
     title: jobInfo.title || hit.job_title_raw || 'Unknown Title',
     company: company,
     url: hit.apply_url || window.location.href,
-    description: decodeHtmlEntities(jobInfo.description || '').substring(0, 2000),
+    description: decodeHtmlEntities(jobInfo.description || processed.description || ''),
     summary: processed.job_summary || processed.summary || jobInfo.summary || null,
     requirements: processed.requirements_summary || jobInfo.requirements || null,
     location: location,
@@ -482,6 +800,7 @@ function extractJobsFromNextData() {
       const job = buildHiringCafeJobFromHit(hit);
       if (index < 3) {
         console.log(`JobPipe: Job ${index} - ID:`, job.id || 'NO-ID', '| URL:', job.url);
+        console.log(`JobPipe: Job ${index} - Description length:`, job.description?.length || 0, '| Preview:', job.description?.substring(0, 100) || 'EMPTY');
       }
       return job;
     });
@@ -504,47 +823,266 @@ function extractJobsFromNextData() {
 
 /**
  * Extract HiringCafe jobs from the live DOM.
- * This is preferred for SPA navigation because it reflects the current page state.
+ * This is the primary extraction method — works for both initial load and SPA navigation.
+ * __NEXT_DATA__ is NOT reliable after SPA navigation (Next.js doesn't update it client-side).
  */
 function extractHiringCafeJobsFromDom() {
   const jobs = [];
-  const jobCards = Array.from(
-    document.querySelectorAll('main article, main li, main [data-job-id], [class*="job-card"]')
-  );
+  const seen = new Set();
 
-  const uniqueUrls = new Set();
-  jobCards.forEach(card => {
-    try {
-      const rect = card.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) {
-        return;
-      }
+  try {
+    document.querySelectorAll('a[href*="/viewjob/"]').forEach(link => {
+      try {
+        const url = link.href;
+        if (seen.has(url)) return;
+        seen.add(url);
 
-      const link = card.querySelector('a[href*="hiring.cafe"], a[href*="/job/"]');
-      if (!link) return;
+        // Find the card container using closest() - matches relative z-index wrapper
+        const card = link.closest('[class*="z-"][class*="relative"]') ||
+                     link.closest('[class*="rounded-xl"]') ||
+                     link.parentElement?.parentElement;
+        if (!card) return;
 
-      const url = link.href;
-      if (uniqueUrls.has(url)) return;
-      uniqueUrls.add(url);
+        // Title: bold line-clamped span inside the card
+        const titleEl = card.querySelector('.font-bold.line-clamp-2, .font-bold.line-clamp-3');
+        const title = titleEl ? titleEl.textContent.trim() : 'Unknown Title';
 
-      const titleEl = card.querySelector('h1, h2, h3, [class*="title"]') || link;
-      const companyEl = card.querySelector('[class*="company"], [class*="Company"], [data-company]');
-      const title = titleEl.textContent.trim() || link.textContent.trim() || link.getAttribute('aria-label') || 'Unknown Title';
-      const company = companyEl?.textContent.trim() || 'Unknown Company';
+        // Company: bold text inside the light description span
+        const summary = card.querySelector('.line-clamp-3.font-light');
+        const companyEl = summary ? summary.querySelector('.font-bold') : null;
+        const company = companyEl ? companyEl.textContent.trim() : 'Unknown Company';
 
-      jobs.push({
-        platform: 'HiringCafe',
-        title: title.substring(0, 200),
-        company: company,
-        url: url,
-        description: '',
-      });
-    } catch (e) {
-      console.error('Error extracting job from link:', e);
-    }
-  });
+        // Try to get description from card text content
+        const cardText = card.textContent || '';
+        const description = cardText.length > title.length + company.length 
+          ? cardText.substring(0, 500).trim() 
+          : `${title} at ${company}`;
 
+        jobs.push({
+          platform: 'HiringCafe',
+          title: title.substring(0, 200),
+          company: company,
+          url: url,
+          description: description,
+        });
+      } catch (e) { /* skip failed items */ }
+    });
+  } catch (e) {
+    console.error('JobPipe: DOM extraction error:', e);
+  }
+
+  console.log(`JobPipe: DOM extracted ${jobs.length} jobs`);
+  if (jobs.length > 0) {
+    console.log(`JobPipe: Sample DOM job description lengths:`, jobs.slice(0, 3).map(j => j.description?.length || 0));
+  }
   return jobs;
+}
+
+// ==================== DETAIL PAGE ENRICHMENT ====================
+
+/**
+ * Extract rich job data from a HiringCafe sidebar detail page (/viewjob/...).
+ * The sidebar detail panel has full descriptions, compensation, requirements, etc.
+ * This is called automatically when navigating to a detail page.
+ */
+function extractHiringCafeDetailPage() {
+  try {
+    // Must be on a detail page
+    if (!window.location.pathname.includes('/viewjob/')) return null;
+
+    console.log('JobPipe: Extracting detail page...');
+
+    // --- Title ---
+    // Usually an h1 or h2 in the detail panel
+    const titleEl = document.querySelector('h1') || document.querySelector('h2');
+    const title = titleEl ? titleEl.textContent.trim() : null;
+    if (!title) {
+      console.log('JobPipe: No title found on detail page');
+      return null;
+    }
+
+    // --- Company ---
+    // Often found in a span after "@" symbol near the title, or in metadata area
+    let company = null;
+    const companyPatterns = [
+      // Look for text containing "@ CompanyName" pattern
+      document.querySelector('[class*="text-gray"][class*="text-sm"], [class*="text-gray"][class*="text-xs"]'),
+    ];
+    // Try finding company from any element containing "@"
+    const allEls = document.querySelectorAll('span, p, div');
+    for (const el of allEls) {
+      const text = el.textContent.trim();
+      const match = text.match(/@\s+(.+)/);
+      if (match && match[1] && match[1].length < 100) {
+        company = match[1].trim();
+        break;
+      }
+    }
+
+    // --- Full page text for fallback extraction ---
+    const pageText = document.body?.textContent || '';
+
+    // --- Posted info ---
+    let postedAgo = null;
+    const postedMatch = pageText.match(/Posted\s+(\d+\s*[dwmyh]\w*)/i);
+    if (postedMatch) postedAgo = postedMatch[1];
+
+    // --- Location ---
+    let location = null;
+    const locationPatterns = [
+      // City, State, Country pattern
+      pageText.match(/([A-Z][a-z]+(?:\s[A-Z][a-z]+)*,\s[A-Z]{2}[a-z]*\s*(?:,\s*[A-Z][a-z]+(?:\s[A-Z][a-z]+)*)?)/),
+    ];
+    // Try looking in elements near the title/company area
+    const metadataArea = titleEl?.parentElement?.parentElement || document.body;
+    const metadataText = metadataArea.textContent || '';
+    const locMatch = metadataText.match(/([A-Z][a-z]+(?:\s[A-Z][a-z]+)*,\s[A-Z]{2}(?:\s[A-Z][a-z]+)?)/);
+    if (locMatch) location = locMatch[1];
+
+    if (!location) {
+      // Broader search: look for city, STATE pattern
+      const broadMatch = pageText.match(/([A-Z][a-z]+(?:\s[A-Z][a-z]+)*,\s[A-Z]{2}\b)/);
+      if (broadMatch) location = broadMatch[1];
+    }
+
+    // --- Compensation ---
+    let compensation = null;
+    const compPatterns = [
+      /\$\d{2,3}k\s*-\s*\$?\d{2,3}k\s*\/\s*(?:yr|mo|hr|wk|day)/i,
+      /\$\d{2,3}k\s*\+\s*\/\s*(?:yr|mo|hr|wk|day)/i,
+      /\$\d+[\d,]*\s*-\s*\$\d+[\d,]*\s*\/\s*(?:yr|mo|hr|wk|day)/i,
+      /\$\d+[\d,]*\s*\+\s*\/\s*(?:yr|mo|hr|wk|day)/i,
+    ];
+    for (const pattern of compPatterns) {
+      const match = pageText.match(pattern);
+      if (match) { compensation = match[0].trim(); break; }
+    }
+
+    // --- Workplace type (Onsite/Hybrid/Remote) ---
+    let workplaceType = null;
+    const workplaceMatch = pageText.match(/\b(Onsite|Remote|Hybrid)\b/i);
+    if (workplaceMatch) workplaceType = workplaceMatch[1];
+
+    // --- Employment type (Full Time, Part Time, Contract, etc.) ---
+    let employmentType = null;
+    const empMatch = pageText.match(/\b(Full Time|Part Time|Contract|Temporary|Internship|Freelance)\b/i);
+    if (empMatch) employmentType = empMatch[1];
+
+    // --- Full Description ---
+    // Look for "Job Description" or "Company Description" sections
+    let description = '';
+    const descSections = [
+      'Job Description',
+      'Company Description',
+      'Job Description:',
+      'Company Description:',
+      'Description',
+      'About the job',
+      'About this role',
+    ];
+    
+    // Try to find description content areas
+    const contentAreas = document.querySelectorAll(
+      '[class*="prose"], [class*="description"], [class*="content"], article, ' +
+      '[class*="text-gray"][class*="leading"], [class*="job-description"], ' +
+      '[class*="rich-text"], [class*="job-detail"]'
+    );
+    
+    if (contentAreas.length > 0) {
+      // Take the largest content area
+      let largest = null;
+      let largestSize = 0;
+      for (const area of contentAreas) {
+        const size = area.textContent.length;
+        if (size > largestSize) {
+          largestSize = size;
+          largest = area;
+        }
+      }
+      if (largest && largestSize > 200) {
+        description = largest.textContent.trim();
+      }
+    }
+
+    // If no content area found, get all non-header text
+    if (!description || description.length < 200) {
+      // Try to get text from the main content panel, excluding nav/header
+      const mainContent = document.querySelector('main') || 
+                          document.querySelector('[role="main"]') ||
+                          document.querySelector('[class*="flex-1"]');
+      if (mainContent) {
+        description = mainContent.textContent.trim();
+      } else {
+        // Fallback: all body text minus header/meta noise
+        description = pageText;
+      }
+    }
+
+    // --- Requirements / Qualifications ---
+    let requirements = null;
+    const reqSections = ['Qualifications', 'Requirements', 'Qualifications:', 'Requirements:'];
+    for (const section of reqSections) {
+      const idx = description.indexOf(section);
+      if (idx >= 0) {
+        // Get ~1000 chars after the section header
+        requirements = description.substring(idx, idx + 1500).trim();
+        break;
+      }
+    }
+
+    // --- Tools/Technologies mentioned ---
+    let technicalTools = null;
+    const toolsLabels = ['Technical Tools', 'Tools', 'Technologies', 'Technical Skills'];
+    for (const label of toolsLabels) {
+      const idx = description.indexOf(label);
+      if (idx >= 0) {
+        technicalTools = description.substring(idx, idx + 500).trim();
+        break;
+      }
+    }
+
+    // --- URL ---
+    const url = window.location.href;
+
+    // --- Views/Saves/Applications from DOM ---
+    const stats = extractHiringCafeStatsFromDom();
+
+    console.log(`JobPipe: Detail page extracted - Title="${title}" Company="${company || 'unknown'}" Desc=${description.length}chars`);
+
+    return {
+      platform: 'HiringCafe',
+      title: title,
+      company: company || 'Unknown Company',
+      url: url,
+      description: decodeHtmlEntities(description),
+      location: location,
+      compensation: compensation,
+      workplace_type: workplaceType,
+      employment_type: employmentType,
+      views: stats.views ?? null,
+      saves: stats.saves ?? null,
+      applications: stats.applications ?? null,
+      posted_ago: postedAgo,
+      requirements: requirements ? decodeHtmlEntities(requirements) : null,
+      technical_tools: technicalTools ? decodeHtmlEntities(technicalTools) : null,
+      // Mark as enriched so background knows to bypass cache
+      enriched: true,
+    };
+  } catch (error) {
+    console.error('JobPipe: Error extracting detail page:', error);
+    return null;
+  }
+}
+
+/**
+ * Check if we're on a HiringCafe detail page and extract enriched data.
+ * Returns enriched job data or null.
+ */
+function tryExtractDetailPage() {
+  const hostname = window.location.hostname.toLowerCase();
+  if (!hostname.includes('hiring.cafe')) return null;
+  if (!window.location.pathname.includes('/viewjob/')) return null;
+  return extractHiringCafeDetailPage();
 }
 
 /**
@@ -556,34 +1094,49 @@ async function extractBatchJobs() {
   const jobs = [];
 
   if (hostname.includes('hiring.cafe')) {
-    console.log('JobPipe: Extracting jobs from HiringCafe...');
-
-    const nextDataJobs = extractJobsFromNextData();
-    const domJobs = extractHiringCafeJobsFromDom();
-
-    const mergedJobs = [];
-    const seenKeys = new Set();
-
-    for (const job of [...nextDataJobs, ...domJobs]) {
-      const key = job.id || job.url;
-      if (!key || seenKeys.has(key)) {
-        continue;
+    // Check if we're on a detail page — extract rich single job data
+    if (window.location.pathname.includes('/viewjob/')) {
+      console.log('JobPipe: On detail page, extracting job from __NEXT_DATA__...');
+      
+      // Try __NEXT_DATA__ first (it has full rich data for the detail page too)
+      const nextDataJobs = extractJobsFromNextData();
+      if (nextDataJobs.length > 0) {
+        // Find the job matching current URL
+        const matchedJob = nextDataJobs.find(j => j.url === window.location.href) || nextDataJobs[0];
+        console.log(`JobPipe: Detail page extracted from __NEXT_DATA__: "${matchedJob.title}" ${matchedJob.description?.length || 0}chars`);
+        return [matchedJob];
       }
-      seenKeys.add(key);
-      mergedJobs.push(job);
+      
+      // Fallback: DOM-based detail extraction
+      console.log('JobPipe: __NEXT_DATA__ empty, trying DOM detail extraction...');
+      const detailJob = extractHiringCafeDetailPage();
+      if (detailJob) {
+        console.log(`JobPipe: Detail page DOM extracted: "${detailJob.title}" ${detailJob.description.length}chars`);
+        return [detailJob];
+      }
+      console.log('JobPipe: Detail page extraction failed, falling back to batch');
     }
 
-    console.log(
-      `JobPipe: HiringCafe merge | __NEXT_DATA__=${nextDataJobs.length} DOM=${domJobs.length} merged=${mergedJobs.length}`
-    );
+    console.log('JobPipe: Extracting jobs from HiringCafe...');
 
-    if (mergedJobs.length === 0) {
-      console.log('JobPipe: No HiringCafe jobs found in DOM or __NEXT_DATA__');
+    // Try __NEXT_DATA__ first for rich data (full descriptions, compensation, etc.)
+    // This is the most reliable method on the initial search results page
+    let extractedJobs = extractJobsFromNextData();
+    
+    if (extractedJobs.length === 0) {
+      // Fallback: DOM-only extraction for SPA-navigated pages
+      console.log('JobPipe: No __NEXT_DATA__ hits, falling back to DOM extraction...');
+      extractedJobs = extractHiringCafeJobsFromDom();
+    }
+
+    console.log(`JobPipe: Found ${extractedJobs.length} jobs`);
+
+    if (extractedJobs.length === 0) {
+      console.log('JobPipe: No HiringCafe jobs found');
       return [];
     }
 
-    // Respect a user-configurable batch limit (stored in chrome.storage.local)
-    // Default to 1000 to avoid accidental huge batches but allow full captures.
+    // Respect a user-configurable batch limit
     const limit = await new Promise((resolve) => {
       try {
         chrome.storage.local.get(['batchCaptureLimit'], (res) => {
@@ -594,7 +1147,7 @@ async function extractBatchJobs() {
       }
     });
 
-    const limitedJobs = mergedJobs.slice(0, limit);
+    const limitedJobs = extractedJobs.slice(0, limit);
     console.log(`JobPipe: Limiting to ${limitedJobs.length} jobs (limit=${limit})`);
     return limitedJobs;
   } else if (hostname.includes('linkedin.com')) {
@@ -655,7 +1208,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ success: true });
     return false;
   }
+
+  // Handle enrichment requests from background script
+  if (request.action === 'ENRICH_CURRENT_JOB') {
+    handleDetailEnrichment(sendResponse);
+    return true;
+  }
+
+  // Handle scrape trigger from background (when a tab opened by our extension finishes loading)
+  if (request.action === 'TRIGGER_SCRAPE') {
+    console.log('JobPipe: Scrape triggered by background (opened tab loaded)');
+    // Force a fresh scrape regardless of previous attempts
+    autoScrapeAttempted = false;
+    lastJobCount = 0;
+    attemptAutoScrape();
+    sendResponse({ success: true });
+    return false;
+  }
 });
+
+// Track sent URLs locally to prevent double-sends within the same page load
+let locallySentUrls = new Set();
 
 // Auto-scrape state
 let autoScrapeEnabled = true; // Enabled by default
@@ -663,6 +1236,9 @@ let autoScrapeAttempted = false;
 let lastUrl = window.location.href;
 let overlayElement = null;
 let overlayVisible = true;
+let lastJobCount = 0; // Track number of jobs last scraped
+let detailPageEnrichmentTimer = null; // Debounce timer for detail page enrichment
+let lastJobSignature = null; // Track last job data signature for change detection
 
 // Check if auto-scrape is enabled on page load
 chrome.storage.local.get(['autoScrapeEnabled'], (result) => {
@@ -678,25 +1254,29 @@ chrome.storage.local.get(['autoScrapeEnabled'], (result) => {
   }
 });
 
-// Detect SPA navigation (URL changes without page reload)
+// Detect SPA navigation and poll for new job data
+
+// Detect URL changes (SPA navigation)
 setInterval(() => {
   const currentUrl = window.location.href;
   if (currentUrl !== lastUrl) {
     console.log('JobPipe: URL changed from', lastUrl, 'to', currentUrl);
     lastUrl = currentUrl;
-    autoScrapeAttempted = false; // Reset so new page can be scraped
+    autoScrapeAttempted = false;
+    lastJobCount = 0;
     if (autoScrapeEnabled) {
-      setTimeout(() => attemptAutoScrape(), 1500); // Wait for page to load
+      setTimeout(() => attemptAutoScrape(), 500);
     }
   }
-}, 1000);
+}, 500);
 
 // Also listen for popstate (browser back/forward)
 window.addEventListener('popstate', () => {
   console.log('JobPipe: Popstate detected');
   autoScrapeAttempted = false;
+  lastJobCount = 0;
   if (autoScrapeEnabled) {
-    setTimeout(() => attemptAutoScrape(), 1500);
+    setTimeout(() => attemptAutoScrape(), 500);
   }
 });
 
@@ -707,16 +1287,18 @@ history.pushState = function() {
   originalPushState.apply(this, arguments);
   console.log('JobPipe: Pushstate detected');
   autoScrapeAttempted = false;
+  lastJobCount = 0;
   if (autoScrapeEnabled) {
-    setTimeout(() => attemptAutoScrape(), 1500);
+    setTimeout(() => attemptAutoScrape(), 500);
   }
 };
 history.replaceState = function() {
   originalReplaceState.apply(this, arguments);
   console.log('JobPipe: Replacestate detected');
   autoScrapeAttempted = false;
+  lastJobCount = 0;
   if (autoScrapeEnabled) {
-    setTimeout(() => attemptAutoScrape(), 1500);
+    setTimeout(() => attemptAutoScrape(), 500);
   }
 };
 
@@ -727,23 +1309,20 @@ console.log('JobPipe content script loaded on:', window.location.href);
  * Create and inject the overlay UI on the page
  */
 function createOverlay() {
-  // Only create overlay on supported sites
-  const hostname = window.location.hostname.toLowerCase();
-  const isSupported = hostname.includes('hiring.cafe') ||
-                      hostname.includes('linkedin.com') ||
-                      hostname.includes('builtin.com') ||
-                      hostname.includes('wellfound.com');
-  
-  if (!isSupported) return;
-  
   // Check if overlay already exists
   if (document.getElementById('jobpipe-overlay')) return;
+  
+  const hostname = window.location.hostname.toLowerCase();
+  const isGeneric = !hostname.includes('hiring.cafe') &&
+                   !hostname.includes('linkedin.com') &&
+                   !hostname.includes('builtin.com') &&
+                   !hostname.includes('wellfound.com');
   
   const overlay = document.createElement('div');
   overlay.id = 'jobpipe-overlay';
   overlay.innerHTML = `
     <div class="jobpipe-overlay-header" id="jobpipe-overlay-header">
-      <span class="jobpipe-overlay-title">📎 JobPipe</span>
+      <span class="jobpipe-overlay-title">📎 JobPipe${isGeneric ? ' (Generic)' : ''}</span>
       <div class="jobpipe-overlay-controls">
         <span class="jobpipe-status-dot" id="jobpipe-status-dot"></span>
         <button class="jobpipe-overlay-toggle" id="jobpipe-overlay-toggle">−</button>
@@ -751,6 +1330,7 @@ function createOverlay() {
     </div>
     <div class="jobpipe-overlay-body" id="jobpipe-overlay-body">
       <div class="jobpipe-overlay-status" id="jobpipe-overlay-status">Ready</div>
+      <div class="jobpipe-overlay-job-title" id="jobpipe-overlay-job-title" style="font-size:11px; opacity:0.9; margin-bottom:8px; max-height:40px; overflow:hidden;"></div>
       <div class="jobpipe-overlay-stats">
         <span id="jobpipe-jobs-found">Found: 0</span>
         <span id="jobpipe-jobs-sent">Sent: 0</span>
@@ -776,10 +1356,11 @@ function createOverlay() {
       color: white;
       border-radius: 8px;
       box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-      z-index: 99999;
+      z-index: 2147483647;
       font-family: 'Segoe UI', Tahoma, sans-serif;
       font-size: 12px;
       transition: all 0.3s ease;
+      isolation: isolate;
     }
     #jobpipe-overlay-header {
       display: flex;
@@ -879,7 +1460,7 @@ function createOverlay() {
     chrome.storage.local.set({ autoScrapeEnabled: autoScrapeEnabled });
     
     // Notify background
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       action: 'SET_AUTO_SCRAPE',
       enabled: autoScrapeEnabled
     });
@@ -927,17 +1508,24 @@ function makeDraggable(element, handle) {
 /**
  * Update overlay status
  */
-function updateOverlayStatus(status, jobsFound = 0, jobsSent = 0) {
+function updateOverlayStatus(status, jobsFound = 0, jobsSent = 0, jobTitle = null) {
   const statusEl = document.getElementById('jobpipe-overlay-status');
   const dotEl = document.getElementById('jobpipe-status-dot');
   const foundEl = document.getElementById('jobpipe-jobs-found');
   const sentEl = document.getElementById('jobpipe-jobs-sent');
+  const titleEl = document.getElementById('jobpipe-overlay-job-title');
   
   if (!statusEl) return;
   
   statusEl.textContent = status;
   foundEl.textContent = `Found: ${jobsFound}`;
   sentEl.textContent = `Sent: ${jobsSent}`;
+  
+  // Update job title display if provided
+  if (titleEl && jobTitle) {
+    titleEl.textContent = `📋 ${jobTitle}`;
+    titleEl.title = jobTitle; // Tooltip with full title
+  }
   
   // Update status dot
   dotEl.className = 'jobpipe-status-dot';
@@ -953,19 +1541,23 @@ async function attemptAutoScrape() {
   autoScrapeAttempted = true;
 
   const hostname = window.location.hostname.toLowerCase();
-  const isSupported = hostname.includes('hiring.cafe') ||
-                      hostname.includes('linkedin.com') ||
-                      hostname.includes('builtin.com') ||
-                      hostname.includes('wellfound.com');
+  // Log the site we're attempting to scrape (now supports any site)
+  console.log('JobPipe: Attempting auto-scrape on:', window.location.href, '(' + hostname + ')');
 
-  if (!isSupported) return;
+  // Check if this URL was already sent in this page session
+  const currentUrl = window.location.href;
+  if (locallySentUrls.has(currentUrl)) {
+    console.log('JobPipe: URL already sent in this page session, skipping');
+    return;
+  }
 
-  console.log('JobPipe: Attempting auto-scrape...');
+  // Detect detail page for enrichment messaging
+  const isDetailPage = window.location.pathname.includes('/viewjob/');
 
   // Notify popup and update overlay of scraping start
-  updateOverlayStatus('Scraping...', 0, 0);
+  updateOverlayStatus(isDetailPage ? 'Enriching...' : 'Scraping...', 0, 0, 'Detecting job...');
   
-  chrome.runtime.sendMessage({
+  safeSendMessage({
     action: 'SCRAPE_STATUS_UPDATE',
     status: 'Scraping...',
     jobsFound: 0,
@@ -973,15 +1565,35 @@ async function attemptAutoScrape() {
   });
 
   try {
-    // Wait for page to fully load
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    // Poll for jobs to appear (SPA navigation may take time to load data)
+    updateOverlayStatus('Waiting for page...', 0, 0, 'Detecting job...');
+    let jobs = [];
+    const maxWait = 10000;
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < maxWait) {
+      jobs = await extractBatchJobs();
+      if (jobs && jobs.length > 0) {
+        console.log(`JobPipe: Found ${jobs.length} jobs after ${Date.now() - startTime}ms`);
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
 
-    const jobs = await extractBatchJobs();
+    // Fallback: try single job extraction (handles generic sites)
+    if (!jobs || jobs.length === 0) {
+      console.log('JobPipe: Batch extraction found no jobs, trying single job extraction...');
+      const singleJob = extractJobData();
+      if (singleJob) {
+        jobs = [singleJob];
+        console.log(`JobPipe: Single job extracted: ${singleJob.title}`);
+      }
+    }
 
     if (!jobs || jobs.length === 0) {
       console.log('JobPipe: No jobs found to auto-scrape');
-      updateOverlayStatus('No jobs found', 0, 0);
-      chrome.runtime.sendMessage({
+      updateOverlayStatus('No jobs found', 0, 0, 'No job detected');
+      safeSendMessage({
         action: 'SCRAPE_STATUS_UPDATE',
         status: 'No jobs found',
         jobsFound: 0,
@@ -990,11 +1602,20 @@ async function attemptAutoScrape() {
       return;
     }
 
+    // Update overlay with job title
+    const jobTitle = jobs[0]?.title || 'Unknown Job';
     console.log(`JobPipe: Auto-scraped ${jobs.length} jobs, sending to server...`);
-    updateOverlayStatus('Sending...', jobs.length, 0);
+    console.log('JobPipe: Job data sample:', JSON.stringify({
+      title: jobs[0]?.title,
+      company: jobs[0]?.company,
+      url: jobs[0]?.url,
+      descriptionLength: jobs[0]?.description?.length || 0,
+      platform: jobs[0]?.platform
+    }));
+    updateOverlayStatus('Sending...', jobs.length, 0, jobTitle);
 
     // Notify jobs found
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       action: 'SCRAPE_STATUS_UPDATE',
       status: 'Sending...',
       jobsFound: jobs.length,
@@ -1007,7 +1628,7 @@ async function attemptAutoScrape() {
     const fullServerUrl = serverUrl.startsWith('http://') ? serverUrl : `http://${serverUrl}`;
 
     // Send to server via background script
-    const response = await chrome.runtime.sendMessage({
+    const response = await safeSendMessage({
       action: 'SEND_BATCH_TO_SERVER',
       jobs: jobs,
       serverUrl: fullServerUrl
@@ -1015,16 +1636,21 @@ async function attemptAutoScrape() {
 
     if (response && response.success) {
       const sentCount = response.count || jobs.length;
-      updateOverlayStatus('Success ✓', jobs.length, sentCount);
-      chrome.runtime.sendMessage({
+      const successLabel = isDetailPage && jobs.length === 1 ? 'Enriched ✓' : 'Success ✓';
+      const displayTitle = jobs[0]?.title || 'Unknown Job';
+      updateOverlayStatus(successLabel, jobs.length, sentCount, displayTitle);
+      safeSendMessage({
         action: 'SCRAPE_STATUS_UPDATE',
-        status: 'Success ✓',
+        status: successLabel,
         jobsFound: jobs.length,
         jobsSent: sentCount
       });
+      // Track this URL to prevent double-sends
+      locallySentUrls.add(currentUrl);
     } else {
-      updateOverlayStatus('Error ✗', jobs.length, 0);
-      chrome.runtime.sendMessage({
+      const displayTitle = jobs[0]?.title || 'Unknown Job';
+      updateOverlayStatus('Error ✗', jobs.length, 0, displayTitle);
+      safeSendMessage({
         action: 'SCRAPE_STATUS_UPDATE',
         status: 'Error ✗',
         jobsFound: jobs.length,
@@ -1034,7 +1660,7 @@ async function attemptAutoScrape() {
   } catch (error) {
     console.error('JobPipe: Auto-scrape error:', error);
     updateOverlayStatus('Error ✗', 0, 0);
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       action: 'SCRAPE_STATUS_UPDATE',
       status: 'Error ✗',
       jobsFound: 0,
@@ -1059,7 +1685,7 @@ async function handleCaptureJob(request, sendResponse) {
     }
 
     // Send to server via background script
-    const result = await chrome.runtime.sendMessage({
+    const result = await safeSendMessage({
       action: 'SEND_TO_SERVER',
       jobData: jobData,
       serverUrl: request.serverUrl,
@@ -1076,14 +1702,46 @@ async function handleCaptureJob(request, sendResponse) {
 }
 
 /**
+ * Handle detail page enrichment request from background script.
+ * Extracts rich data from the current detail page and sends it to the server.
+ */
+async function handleDetailEnrichment(sendResponse) {
+  try {
+    const detailJob = tryExtractDetailPage();
+    if (!detailJob) {
+      sendResponse({ success: false, error: 'Not on a detail page' });
+      return;
+    }
+
+    // Get server URL
+    const result = await chrome.storage.local.get(['serverUrl']);
+    const serverUrl = result.serverUrl || '127.0.0.1:3838';
+    const fullServerUrl = serverUrl.startsWith('http://') ? serverUrl : `http://${serverUrl}`;
+
+    // Send as enrichment (background will bypass cache for enriched jobs)
+    const response = await safeSendMessage({
+      action: 'SEND_ENRICHED_TO_SERVER',
+      jobData: detailJob,
+      serverUrl: fullServerUrl,
+    });
+
+    sendResponse(response);
+  } catch (error) {
+    console.error('JobPipe: Enrichment error:', error);
+    sendResponse({ success: false, error: error.message });
+  }
+}
+
+/**
  * Handle batch job capture
  */
 async function handleCaptureBatch(request, sendResponse) {
   try {
     console.log('JobPipe content: handleCaptureBatch called, serverUrl=', request.serverUrl);
 
-    // Reset auto-scrape flag to allow re-scraping (for manual capture or new searches)
+    // Reset flags to allow re-scraping (for manual capture or new searches)
     autoScrapeAttempted = false;
+    lastJobSignature = null; // Force fresh data detection
 
     // Force fresh extraction by clearing any cached data
     const jobs = await extractBatchJobs();
@@ -1098,7 +1756,7 @@ async function handleCaptureBatch(request, sendResponse) {
     }
 
     // Send batch to server
-    const result = await chrome.runtime.sendMessage({
+    const result = await safeSendMessage({
       action: 'SEND_BATCH_TO_SERVER',
       jobs: jobs,
       serverUrl: request.serverUrl,
@@ -1115,5 +1773,8 @@ async function handleCaptureBatch(request, sendResponse) {
   }
 }
 
+// Initialize job count tracking for SPA navigation detection
+lastJobCount = 0;
+
 // Notify background script that content script is ready
-chrome.runtime.sendMessage({ action: 'CONTENT_SCRIPT_READY' });
+safeSendMessage({ action: 'CONTENT_SCRIPT_READY' });

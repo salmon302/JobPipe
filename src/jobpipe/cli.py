@@ -21,7 +21,8 @@ from jobpipe.storage.db import initialize_database
 from jobpipe.storage.repository import JobRepository
 
 LOGGER = logging.getLogger(__name__)
-_RUNTIME_COMMANDS = {"ingest-server", "gui"}
+_RUNTIME_COMMANDS = {"ingest-server"}
+_GUI_REQUIRED_SETTINGS = {"db_path", "master_cv_path", "resume_output_dir"}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -138,6 +139,17 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_gui_settings(settings: Settings) -> None:
+    """Validate only the settings required for the GUI."""
+    errors: list[str] = []
+    if not settings.db_path.parent.exists():
+        errors.append(f"Database directory does not exist: {settings.db_path.parent}")
+    if not settings.master_cv_path.exists():
+        errors.append(f"Master CV not found: {settings.master_cv_path}")
+    if errors:
+        raise InvalidSettingsError("Invalid GUI settings:\n" + "\n".join(f"- {e}" for e in errors))
+
+
 def main(argv: list[str] | None = None) -> int:
     configure_logging()
     parser = _build_parser()
@@ -156,6 +168,9 @@ def main(argv: list[str] | None = None) -> int:
         except InvalidSettingsError as exc:
             LOGGER.error("%s", exc)
             return 2
+
+    if args.command == "gui":
+        _validate_gui_settings(settings)
 
     if args.command == "init-db":
         db_path = args.db_path or settings.db_path

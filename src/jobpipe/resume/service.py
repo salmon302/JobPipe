@@ -227,7 +227,7 @@ def ats_optimize_resume(
     tex_content: str,
     job_description: str,
     gemini_api_key: str | None = None,
-    gemini_model: str = "gemini-1.5-flash",
+    gemini_model: str = "gemini-flash-latest",
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta",
 ) -> dict:
     """

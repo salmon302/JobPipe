@@ -2,6 +2,46 @@
 // Author: Seth Nenninger (Tencent: Hy3 preview Agent)
 // Timestamp: 2026-05-12T18:45:00Z
 
+// ==================== HELPER FUNCTIONS ====================
+
+/**
+ * Safely send a message to the extension background script.
+ * Handles "Extension context invalidated" errors gracefully.
+ * @param {Object} message - The message to send
+ * @param {Function} [callback] - Optional callback for response
+ * @returns {Promise|undefined} - Returns a promise if no callback, or undefined
+ */
+function safeSendMessage(message, callback) {
+  try {
+    if (chrome.runtime?.id) {
+      if (callback) {
+        chrome.runtime.sendMessage(message, callback);
+      } else {
+        return chrome.runtime.sendMessage(message).catch((error) => {
+          if (error.message?.includes('Extension context invalidated')) {
+            console.warn('JobPipe: Extension context invalidated:', error.message);
+          } else {
+            console.error('JobPipe: Error sending message:', error);
+          }
+          return Promise.resolve(undefined);
+        });
+      }
+    } else {
+      console.warn('JobPipe: Extension context invalidated, cannot send message:', message.action);
+      if (callback) callback(undefined);
+      return Promise.resolve(undefined);
+    }
+  } catch (error) {
+    if (error.message?.includes('Extension context invalidated')) {
+      console.warn('JobPipe: Extension context invalidated:', error.message);
+    } else {
+      console.error('JobPipe: Error sending message:', error);
+    }
+    if (callback) callback(undefined);
+    return Promise.resolve(undefined);
+  }
+}
+
 const DEFAULT_SERVER_URL = '127.0.0.1:3838';
 
 let serverUrl = DEFAULT_SERVER_URL;
@@ -115,7 +155,7 @@ function setupEventListeners() {
   const clearCacheBtn = document.getElementById('clearCacheBtn');
   if (clearCacheBtn) {
     clearCacheBtn.addEventListener('click', async () => {
-      chrome.runtime.sendMessage({ action: 'CLEAR_CACHE' }, (response) => {
+      safeSendMessage({ action: 'CLEAR_CACHE' }, (response) => {
         if (response && response.success) {
           showMessage('Cache cleared! You can now re-send jobs.', 'success');
         }
@@ -141,7 +181,7 @@ function setupEventListeners() {
     }
 
     // Notify background worker
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       action: 'SET_AUTO_SCRAPE',
       enabled: enabled
     });
@@ -274,8 +314,7 @@ function updateScrapeStatus(data) {
     if (data.scoringInProgress) {
       showMessage('Scoring in progress in background...', 'info');
     }
-  }
-}
+
     if (data.status === 'Scraping...') {
       scrapeStatusEl.classList.add('status-scraping');
     } else if (data.status === 'Complete') {
@@ -283,11 +322,12 @@ function updateScrapeStatus(data) {
     } else if (data.status === 'Error') {
       scrapeStatusEl.classList.add('status-error');
     }
-  }
-  if (data.jobsFound !== undefined) {
-    jobsFoundEl.textContent = data.jobsFound;
-  }
-  if (data.jobsSent !== undefined) {
-    jobsSentEl.textContent = data.jobsSent;
+
+    if (data.jobsFound !== undefined) {
+      jobsFoundEl.textContent = data.jobsFound;
+    }
+    if (data.jobsSent !== undefined) {
+      jobsSentEl.textContent = data.jobsSent;
+    }
   }
 }

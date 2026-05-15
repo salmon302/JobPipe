@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import NamedTuple
+
+from jobpipe.scoring.embeddings import cosine_similarity
 
 
 class ScoreWeights(NamedTuple):
@@ -29,19 +31,72 @@ class ScoreBreakdown:
     recency: float
     total: float
     details: str = ""  # Additional details about scoring
+    confidence: str = "medium"  # "high", "medium", "low"
 
 
 @dataclass(frozen=True)
-class SectionWeights(NamedTuple):
+class SectionWeights:
     """Weights for different CV sections in relevance scoring."""
-    skills: float = 0.4
-    experience: float = 0.3
-    education: float = 0.2
-    projects: float = 0.1
+    skills: float = 0.35
+    experience: float = 0.30
+    education: float = 0.10
+    projects: float = 0.20
+    summary: float = 0.05
 
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
+
+
+def _detect_job_type(title: str, description: str) -> str:
+    """Detect job type for dynamic weight adjustment."""
+    combined = f"{title} {description}".lower()
+    if any(kw in combined for kw in ("intern", "internship", "entry", "junior", "graduate")):
+        return "entry"
+    if any(kw in combined for kw in ("senior", "lead", "principal", "staff", "head of", "director")):
+        return "senior"
+    if any(kw in combined for kw in ("research", "scientist", "researcher", "academic")):
+        return "research"
+    return "standard"
+
+
+def select_weights_for_job_type(job_type: str) -> ScoreWeights:
+    """Select dynamic weights based on job type."""
+    weights = {
+        "entry": ScoreWeights(relevance=0.35, attainability=0.45, recency=0.20),
+        "senior": ScoreWeights(relevance=0.55, attainability=0.30, recency=0.15),
+        "research": ScoreWeights(relevance=0.60, attainability=0.25, recency=0.15),
+        "standard": ScoreWeights(relevance=0.50, attainability=0.30, recency=0.20),
+    }
+    return weights.get(job_type, weights["standard"])
+
+
+def compute_confidence(
+    relevance_detail: str,
+    attainability_detail: str,
+    cv_parsed: bool = False,
+) -> str:
+    """Determine confidence level based on data quality."""
+    reasons: list[str] = []
+
+    if cv_parsed:
+        reasons.append("cv_parsed")
+    if "No CV sections" in relevance_detail or "No valid sections" in relevance_detail:
+        reasons.append("relevance_defaults")
+    if "No keywords" in relevance_detail:
+        reasons.append("no_keywords")
+    if "No domain" in relevance_detail:
+        reasons.append("no_domain")
+    if "No skills" in attainability_detail or "No education" in attainability_detail:
+        reasons.append("attainability_defaults")
+
+    if not cv_parsed:
+        return "low"
+    if len(reasons) <= 1:
+        return "high"
+    if len(reasons) <= 3:
+        return "medium"
+    return "low"
 
 
 def compute_total_match_score(
@@ -49,6 +104,7 @@ def compute_total_match_score(
     attainability: float,
     recency: float,
     weights: ScoreWeights | None = None,
+    confidence: str = "medium",
 ) -> ScoreBreakdown:
     """Compute total match score with configurable weights."""
     rel = _clamp01(relevance)
@@ -62,7 +118,10 @@ def compute_total_match_score(
     norm_weights = weights.normalize()
     
     total = (rel * norm_weights.relevance) + (att * norm_weights.attainability) + (rec * norm_weights.recency)
-    return ScoreBreakdown(relevance=rel, attainability=att, recency=rec, total=_clamp01(total))
+    return ScoreBreakdown(
+        relevance=rel, attainability=att, recency=rec,
+        total=_clamp01(total), confidence=confidence,
+    )
 
 
 def compute_section_weighted_relevance(
@@ -74,7 +133,8 @@ def compute_section_weighted_relevance(
     """Compute relevance score weighted by CV sections.
     
     Args:
-        cv_sections: Dict with keys like 'skills', 'experience', 'education', 'projects'
+        cv_sections: Dict with keys like 'skills', 'experience', 'education',
+                     'projects', 'summary'
         job_description: Full job description text
         embedder: Embedder instance
         section_weights: Weights for each section
@@ -98,6 +158,7 @@ def compute_section_weighted_relevance(
         "experience": section_weights.experience,
         "education": section_weights.education,
         "projects": section_weights.projects,
+        "summary": section_weights.summary,
     }
     
     for section_name, weight in section_map.items():
@@ -119,3 +180,42 @@ def compute_section_weighted_relevance(
     final_score = weighted_sum / weight_sum
     details = ", ".join(details_parts)
     return final_score, details
+
+
+def compute_blended_relevance(
+    embedding_score: float,
+    keyword_score: float,
+    domain_score: float,
+    embedding_weight: float = 0.60,
+    keyword_weight: float = 0.25,
+    domain_weight: float = 0.15,
+) -> tuple[float, str]:
+    """Blend embedding, keyword, and domain scores into a single relevance.
+
+    Args:
+        embedding_score: Section-weighted embedding similarity [0, 1].
+        keyword_score: Keyword density score [0, 1].
+        domain_score: Domain alignment score [0, 1].
+        embedding_weight: Weight for embedding component.
+        keyword_weight: Weight for keyword component.
+        domain_weight: Weight for domain component.
+
+    Returns:
+        Tuple of (blended_score, details_string).
+    """
+    total_weight = embedding_weight + keyword_weight + domain_weight
+    if total_weight == 0:
+        return 0.0, "Zero weights for blending"
+
+    blended = (
+        _clamp01(embedding_score) * embedding_weight
+        + _clamp01(keyword_score) * keyword_weight
+        + _clamp01(domain_score) * domain_weight
+    ) / total_weight
+
+    details = (
+        f"embed={embedding_score:.3f}(w={embedding_weight:.2f}) "
+        f"kw={keyword_score:.3f}(w={keyword_weight:.2f}) "
+        f"domain={domain_score:.3f}(w={domain_weight:.2f})"
+    )
+    return _clamp01(blended), details

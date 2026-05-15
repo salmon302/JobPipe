@@ -284,7 +284,7 @@ class TestGUIIntegration:
         monkeypatch.setenv("JOBPIPE_DB_PATH", str(db_path))
         monkeypatch.setenv("JOBPIPE_MASTER_CV_PATH", str(cv_path))
         monkeypatch.setenv("JOBPIPE_RESUME_VARIANTS_DIR", str(tmp_path / "resume_variants"))
-        monkeypatch.setenv("JOBPIPE_ATS_OPTIMIZATION_MODEL", "gemini-1.5-flash")
+        monkeypatch.setenv("JOBPIPE_ATS_OPTIMIZATION_MODEL", "gemini-flash-latest")
         monkeypatch.setenv("JOBPIPE_MASTER_CV_HASH_ALGORITHM", "sha256")
 
         from jobpipe.config import Settings

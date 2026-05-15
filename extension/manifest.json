@@ -7,14 +7,16 @@
     "activeTab",
     "storage",
     "scripting",
-    "notifications"
+    "notifications",
+    "tabs"
   ],
   "host_permissions": [
     "http://127.0.0.1:3838/*",
     "https://*.hiring.cafe/*",
     "https://*.linkedin.com/*",
     "https://*.builtin.com/*",
-    "https://*.wellfound.com/*"
+    "https://*.wellfound.com/*",
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background/service_worker.js"

@@ -17,9 +17,21 @@ from jobpipe.config import Settings
 from jobpipe.notifications.windows_toast import notify_job_match
 from jobpipe.resume.staging import ResumeTargetNotFoundError, stage_job_description
 from jobpipe.scoring.attainability import attainability_score, should_discard_for_senior_role
-from jobpipe.scoring.calculator import compute_total_match_score
+from jobpipe.scoring.calculator import (
+    ScoreWeights,
+    SectionWeights,
+    compute_blended_relevance,
+    compute_confidence,
+    compute_total_match_score,
+    cosine_similarity,
+    _detect_job_type,
+    select_weights_for_job_type,
+)
+from jobpipe.scoring.cv_parser import ParsedCV, parse_cv_text
+from jobpipe.scoring.domain_matcher import domain_alignment_score
 from jobpipe.scoring.embeddings import LocalEmbedder, relevance_scores
 from jobpipe.scoring.extractors import extract_years_required, infer_remote
+from jobpipe.scoring.keyword_scorer import build_keyword_lexicon, keyword_density_score
 from jobpipe.scoring.recency import recency_score
 from jobpipe.storage.db import initialize_database
 from jobpipe.storage.models import JobRecord
@@ -105,18 +117,57 @@ def _release_run_lock(lock_path: Path) -> None:
         pass
 
 
-def score_pending_jobs(
-    settings: Settings,
-    repository: JobRepository,
-    run_id: str | None = None,
-    limit: int = 500,
-) -> ScoreSummary:
+def _parse_master_cv(settings: Settings) -> tuple[str, object | None]:
+    """Load and parse the Master CV, returning (raw_text, parsed_cv_or_None)."""
     cv_text = _load_master_cv(settings.master_cv_path)
     if not cv_text.strip():
         raise MissingMasterCVError(
             f"Master CV is missing or empty at {settings.master_cv_path}. "
             "Create it or set JOBPIPE_MASTER_CV_PATH."
         )
+    try:
+        parsed = parse_cv_text(cv_text)
+        LOGGER.info(
+            "Parsed CV: %d skills, %d education entries, %d experience entries, %d projects",
+            len(parsed.skills.all_skills()),
+            len(parsed.education),
+            len(parsed.experience),
+            len(parsed.projects),
+        )
+        return cv_text, parsed
+    except Exception:
+        LOGGER.exception("CV parsing failed, falling back to flat text")
+        return cv_text, None
+
+
+def score_pending_jobs(
+    settings: Settings,
+    repository: JobRepository,
+    run_id: str | None = None,
+    limit: int = 500,
+) -> ScoreSummary:
+    cv_text, parsed_cv = _parse_master_cv(settings)
+    cv_parsed = parsed_cv is not None
+    # We still compute full-CV embedding for the legacy flat similarity
+    # (used as a fallback dimension)
+    embedder = LocalEmbedder(
+        settings.embed_model,
+        batch_size=settings.embed_batch_size,
+    )
+    flat_cv_vector = embedder.embed_text(cv_text)
+
+    # Build keyword lexicon from parsed CV (if available)
+    keyword_lexicon: dict[str, float] = {}
+    if parsed_cv is not None:
+        keyword_lexicon = build_keyword_lexicon(parsed_cv)  # type: ignore[arg-type]
+
+    # Build section weights from settings
+    section_weights = SectionWeights(
+        skills=settings.skills_section_weight,
+        experience=settings.experience_section_weight,
+        education=settings.education_section_weight,
+        projects=settings.projects_section_weight,
+    )
 
     scored = 0
     updates: list[tuple] = []
@@ -155,43 +206,106 @@ def score_pending_jobs(
         to_score_meta.append((job, years_required, is_remote))
 
     if to_score_jobs:
-        embedder = LocalEmbedder(
-            settings.embed_model,
-            batch_size=settings.embed_batch_size,
-        )
-        cv_vector = embedder.embed_text(cv_text)
-        relevance_values = relevance_scores(
-            [job.description for job in to_score_jobs],
-            cv_vector,
+        cv_sections = parsed_cv.to_section_dict() if parsed_cv is not None else {}
+        job_descriptions = [job.description for job in to_score_jobs]
+
+        # Compute flat relevance as baseline
+        flat_relevance_values = relevance_scores(
+            job_descriptions,
+            flat_cv_vector,
             embedder,
         )
 
-        for (job, years_required, is_remote), relevance in zip(
-            to_score_meta, relevance_values
-        ):
-            attainability_score_value, attainability_details = attainability_score(
-                required_years=years_required,
-                user_years_experience=settings.user_years_experience,
-            )
-            recency = recency_score(job.date_posted, is_remote)
-            breakdown = compute_total_match_score(
-                relevance=relevance,
-                attainability=attainability_score_value,
-                recency=recency,
+        # Pre-compute section vectors once if CV is parsed
+        section_vectors: dict[str, object] = {}
+        if cv_sections:
+            sec_map = {
+                "skills": section_weights.skills,
+                "experience": section_weights.experience,
+                "education": section_weights.education,
+                "projects": section_weights.projects,
+                "summary": getattr(section_weights, 'summary', 0.05),
+            }
+            for sec_name in sec_map:
+                sec_text = cv_sections.get(sec_name, "").strip()
+                if sec_text:
+                    section_vectors[sec_name] = embedder.embed_text(sec_text)
+
+        # Batch-embed job descriptions for section scoring
+        job_vectors = embedder.embed_texts(job_descriptions) if section_vectors else None
+
+        for idx, (job, years_required, is_remote) in enumerate(to_score_meta):
+            # ---- Blended relevance ----
+            # Section-weighted embedding score
+            if section_vectors and job_vectors is not None:
+                job_vec = job_vectors[idx]
+                weighted_sum = 0.0
+                weight_sum = 0.0
+                sec_parts = []
+                for sec_name, sec_vec in section_vectors.items():
+                    weight = sec_map[sec_name]
+                    sim = max(-1.0, min(1.0, cosine_similarity(sec_vec, job_vec)))
+                    sec_score = (sim + 1.0) / 2.0
+                    weighted_sum += sec_score * weight
+                    weight_sum += weight
+                    sec_parts.append(f"{sec_name}:{sec_score:.3f}(w={weight})")
+                section_emb_score = weighted_sum / weight_sum if weight_sum > 0 else flat_relevance_values[idx]
+                section_detail = ", ".join(sec_parts) if sec_parts else "flat_fallback"
+            else:
+                section_emb_score = flat_relevance_values[idx]
+                section_detail = "flat_only"
+
+            # Keyword density score
+            kw_score, kw_detail = keyword_density_score(job.description, keyword_lexicon) if keyword_lexicon else (0.5, "no_lexicon")
+
+            # Domain alignment
+            dom_score, dom_detail = domain_alignment_score(job.title, job.description, parsed_cv) if parsed_cv else (0.5, "no_cv")
+
+            # Blend into final relevance
+            blended_relevance, rel_detail = compute_blended_relevance(
+                embedding_score=section_emb_score,
+                keyword_score=kw_score,
+                domain_score=dom_score,
             )
 
-            updates.append(
-                (
-                    breakdown.total,
-                    years_required,
-                    is_remote,
-                    "Queued",
-                    breakdown.relevance,
-                    breakdown.attainability,
-                    breakdown.recency,
-                    job.id,
-                )
+            # ---- Attainability ----
+            att_score, att_detail = attainability_score(
+                required_years=years_required,
+                user_years_experience=settings.user_years_experience,
+                cv=parsed_cv,
+                job_description=job.description,
+                job_title=job.title,
+                is_remote_job=is_remote,
             )
+
+            # ---- Recency ----
+            rec = recency_score(job.date_posted, is_remote)
+
+            # ---- Dynamic weights by job type ----
+            job_type = _detect_job_type(job.title, job.description)
+            weights = select_weights_for_job_type(job_type)
+
+            confidence = compute_confidence(rel_detail, att_detail, cv_parsed=cv_parsed)
+
+            breakdown = compute_total_match_score(
+                relevance=blended_relevance,
+                attainability=att_score,
+                recency=rec,
+                weights=weights,
+                confidence=confidence,
+            )
+
+            full_details = (
+                f"type={job_type}, embed({section_detail}), "
+                f"kw({kw_detail}), domain({dom_detail}), "
+                f"attain({att_detail}), conf={confidence}"
+            )
+
+            updates.append((
+                breakdown.total, years_required, is_remote, "Queued",
+                breakdown.relevance, breakdown.attainability, breakdown.recency,
+                job.id,
+            ))
             scored += 1
 
     repository.update_scoring_bulk(updates)

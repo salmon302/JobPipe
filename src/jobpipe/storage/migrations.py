@@ -144,7 +144,133 @@ _MIGRATIONS: list[tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_variants_created ON resume_variants(created_at DESC);
         """,
     ),
+    (
+        7,
+        """
+        CREATE INDEX IF NOT EXISTS idx_jobs_score_posted ON jobs(match_score DESC, date_posted DESC);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS jobs_fts USING fts5(
+            title,
+            company,
+            description,
+            summary,
+            requirements,
+            location,
+            county,
+            compensation,
+            workplace_type,
+            employment_type,
+            department,
+            team,
+            platform,
+            status,
+            url,
+            content='jobs',
+            content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS jobs_ai AFTER INSERT ON jobs BEGIN
+            INSERT INTO jobs_fts(
+                rowid,
+                title,
+                company,
+                description,
+                summary,
+                requirements,
+                location,
+                county,
+                compensation,
+                workplace_type,
+                employment_type,
+                department,
+                team,
+                platform,
+                status,
+                url
+            ) VALUES (
+                new.rowid,
+                new.title,
+                new.company,
+                new.description,
+                new.summary,
+                new.requirements,
+                new.location,
+                new.county,
+                new.compensation,
+                new.workplace_type,
+                new.employment_type,
+                new.department,
+                new.team,
+                new.platform,
+                new.status,
+                new.url
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS jobs_ad AFTER DELETE ON jobs BEGIN
+            INSERT INTO jobs_fts(jobs_fts, rowid) VALUES('delete', old.rowid);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS jobs_au AFTER UPDATE ON jobs BEGIN
+            INSERT INTO jobs_fts(jobs_fts, rowid) VALUES('delete', old.rowid);
+            INSERT INTO jobs_fts(
+                rowid,
+                title,
+                company,
+                description,
+                summary,
+                requirements,
+                location,
+                county,
+                compensation,
+                workplace_type,
+                employment_type,
+                department,
+                team,
+                platform,
+                status,
+                url
+            ) VALUES (
+                new.rowid,
+                new.title,
+                new.company,
+                new.description,
+                new.summary,
+                new.requirements,
+                new.location,
+                new.county,
+                new.compensation,
+                new.workplace_type,
+                new.employment_type,
+                new.department,
+                new.team,
+                new.platform,
+                new.status,
+                new.url
+            );
+        END;
+
+        INSERT INTO jobs_fts(jobs_fts) VALUES('rebuild');
+        """,
+    ),
 ]
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row[1] for row in rows}
+
+
+def _add_columns_if_missing(
+    conn: sqlite3.Connection,
+    table_name: str,
+    column_defs: list[tuple[str, str]],
+) -> None:
+    existing_columns = _table_columns(conn, table_name)
+    for column_name, column_sql in column_defs:
+        if column_name in existing_columns:
+            continue
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
 
 
 def latest_schema_version() -> int:
@@ -169,6 +295,47 @@ def apply_migrations(conn: sqlite3.Connection) -> int:
 
     for version, sql in _MIGRATIONS:
         if version <= current:
+            continue
+
+        if version == 4:
+            _add_columns_if_missing(
+                conn,
+                "jobs",
+                [
+                    ("match_score", "match_score REAL"),
+                    ("score_relevance", "score_relevance REAL"),
+                    ("score_attainability", "score_attainability REAL"),
+                    ("score_recency", "score_recency REAL"),
+                ],
+            )
+            _set_schema_version(conn, version)
+            current = version
+            continue
+
+        if version == 5:
+            _add_columns_if_missing(
+                conn,
+                "jobs",
+                [
+                    ("platform", "platform TEXT"),
+                    ("summary", "summary TEXT"),
+                    ("requirements", "requirements TEXT"),
+                    ("location", "location TEXT"),
+                    ("county", "county TEXT"),
+                    ("compensation", "compensation TEXT"),
+                    ("workplace_type", "workplace_type TEXT"),
+                    ("employment_type", "employment_type TEXT"),
+                    ("department", "department TEXT"),
+                    ("team", "team TEXT"),
+                    ("views", "views INTEGER"),
+                    ("saves", "saves INTEGER"),
+                    ("applications", "applications INTEGER"),
+                    ("posted_at", "posted_at TEXT"),
+                    ("posted_ago", "posted_ago TEXT"),
+                ],
+            )
+            _set_schema_version(conn, version)
+            current = version
             continue
 
         conn.executescript(sql)

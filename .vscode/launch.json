@@ -10,6 +10,7 @@
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true,
+      "raise": "False",
       "envFile": "${workspaceFolder}/.env",
       "env": {
         "PYTHONPATH": "${workspaceFolder}/src",
@@ -25,6 +26,7 @@
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true,
+      "raise": "False",
       "envFile": "${workspaceFolder}/.env",
       "env": {
         "PYTHONPATH": "${workspaceFolder}/src",
@@ -40,6 +42,7 @@
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true,
+      "raise": "False",
       "envFile": "${workspaceFolder}/.env",
       "env": {
         "PYTHONPATH": "${workspaceFolder}/src",
@@ -55,6 +58,7 @@
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true,
+      "raise": "False",
       "env": {
         "PYTHONPATH": "${workspaceFolder}/src",
         "PYTHONEXECUTABLE": "py -3.14"
@@ -84,6 +88,7 @@
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": false,
+      "raise": "False",
       "env": {
         "PYTHONPATH": "${workspaceFolder}/src"
       }
@@ -95,7 +100,8 @@
       "connect": {
         "host": "localhost",
         "port": 5678
-      }
+      },
+      "raise": "False"
     }
   ]
 }

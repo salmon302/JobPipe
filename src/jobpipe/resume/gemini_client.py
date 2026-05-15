@@ -21,7 +21,7 @@ class GeminiConfig:
     """Configuration for Gemini API client."""
 
     api_key: str
-    model: str = "gemini-1.5-flash"
+    model: str = "gemini-flash-latest"
     base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     timeout_seconds: int = 60
     max_retries: int = 3
@@ -47,9 +47,16 @@ def _build_resume_prompt(
     master_cv: str,
     job_description: str,
     latex_template: str | None = None,
+    max_pages: str = "1",
 ) -> str:
-    """Build the prompt for resume generation."""
+    """Build the prompt for resume generation.
 
+    Args:
+        master_cv: The Master CV markdown content.
+        job_description: The job description text.
+        latex_template: Optional LaTeX template to follow.
+        max_pages: "1" for one page, "half" for a compact half-page resume.
+    """
     template_section = ""
     if latex_template:
         template_section = f"""
@@ -58,18 +65,33 @@ def _build_resume_prompt(
 
 """
 
-    return f"""You are an expert resume writer specializing in creating targeted, one-page LaTeX resumes.
+    if max_pages == "half":
+        page_instruction = (
+            "Keep the resume to HALF a page maximum — extremely compact.\n"
+            "- Use \\small or \\footnotesize font size\n"
+            "- Tight margins (0.5in or less)\n"
+            "- Only 2-3 most relevant bullet points total\n"
+            "- Single section for Experience (omit Projects/Education unless critical)\n"
+            "- Prioritize a brief Skills line and a short Summary"
+        )
+    else:
+        page_instruction = (
+            "Keep the resume to ONE page maximum.\n"
+            "- Use standard LaTeX article class with geometry package for margins\n"
+            "- Emphasize skills and experience relevant to the job description\n"
+            "- Use bullet points for achievements with quantifiable results where available\n"
+            "- Maintain a clean, professional layout"
+        )
+
+    return f"""You are an expert resume writer specializing in creating targeted LaTeX resumes.
 
 ## Task
 Generate a tailored LaTeX resume based on the provided Master CV and Job Description. The resume must be factual, concise, and optimized for the specific job.
 
 ## Constraints
 - Use ONLY information from the Master CV (do not invent projects, metrics, or experience)
-- Keep the resume to ONE page maximum
-- Use standard LaTeX article class with geometry package for margins
-- Emphasize skills and experience relevant to the job description
-- Use bullet points for achievements with quantifiable results where available
-- Maintain a clean, professional layout
+- {page_instruction}
+- Use ONLY the following LaTeX packages: article, geometry, enumitem, hyperref, xcolor, fontenc, inputenc, setspace
 
 {template_section}
 ## Master CV:
@@ -120,9 +142,20 @@ class GeminiClient:
         master_cv: str,
         job_description: str,
         latex_template: str | None = None,
+        max_pages: str = "1",
     ) -> GeminiResponse:
-        """Generate a targeted LaTeX resume using Gemini API."""
-        prompt = _build_resume_prompt(master_cv, job_description, latex_template)
+        """Generate a targeted LaTeX resume using Gemini API.
+
+        Args:
+            master_cv: The Master CV markdown content.
+            job_description: The job description text.
+            latex_template: Optional LaTeX template to follow.
+            max_pages: "1" for one page, "half" for a compact half-page resume.
+
+        Returns:
+            GeminiResponse with the generated LaTeX code.
+        """
+        prompt = _build_resume_prompt(master_cv, job_description, latex_template, max_pages)
 
         url = f"{self._config.base_url}/models/{self._config.model}:generateContent"
         headers = {
@@ -216,7 +249,7 @@ def create_gemini_client_from_settings(settings: Settings) -> GeminiClient:
 
     config = GeminiConfig(
         api_key=api_key,
-        model=getattr(settings, "gemini_model", "gemini-1.5-flash"),
+        model=getattr(settings, "gemini_model", "gemini-flash-latest"),
         base_url=getattr(
             settings, "gemini_base_url", "https://generativelanguage.googleapis.com/v1beta"
         ),

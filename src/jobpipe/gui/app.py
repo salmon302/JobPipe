@@ -24,10 +24,11 @@ try:
         QRunnable,
         Qt,
         QThreadPool,
+        QTimer,
         QUrl,
         Signal,
     )
-    from PySide6.QtGui import QAction, QDesktopServices, QFont
+    from PySide6.QtGui import QAction, QDesktopServices, QFont, QKeySequence, QShortcut
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -43,8 +44,10 @@ try:
         QPlainTextEdit,
         QPushButton,
         QSlider,
+        QSpinBox,
         QSplitter,
-        QTableWidget,
+        QMenu,
+            QTableWidget,
         QTableWidgetItem,
         QTabWidget,
         QVBoxLayout,
@@ -104,6 +107,15 @@ class JobPipeMainWindow(QMainWindow):
         self._ingest_server: IngestServer | None = None
         self._intro_animation: QPropertyAnimation | None = None
 
+        # Enrichment polling state
+        self._enrichment_poll_timer = QTimer(self)
+        self._enrichment_poll_timer.setInterval(2000)  # Poll every 2s
+        self._enrichment_poll_timer.timeout.connect(self._check_enrichment_status)
+        self._enrichment_poll_count = 0
+        self._enrichment_poll_max = 15  # ~30 seconds max
+        self._enrichment_job_id: str | None = None
+        self._enrichment_job_row: int | None = None
+
         self._ingest_status_value = QLabel("Starting")
         self._ingest_endpoint_value = QLabel("n/a")
 
@@ -134,6 +146,10 @@ class JobPipeMainWindow(QMainWindow):
         self._resume_status_value = QLabel("Idle")
         self._resume_status_value.setProperty("role", "statusBadge")
         self._resume_last_pdf_path: Path | None = None
+        self._resume_context_label = QLabel("No job selected")
+        self._resume_context_label.setProperty("role", "muted")
+        self._resume_gen_1page_button = QPushButton("Generate 1-Page Resume")
+        self._resume_gen_halfpage_button = QPushButton("Generate 1/2-Page Resume")
 
         self._db_path_value = QLabel("n/a")
         self._threshold_value = QLabel("n/a")
@@ -146,6 +162,16 @@ class JobPipeMainWindow(QMainWindow):
         self._jobs_table = self._create_table(
             ["Total", "Relevance", "Attainability", "Recency", "Title", "Company", "Platform", "Status", "Posted", "URL"]
         )
+        self._jobs_search_input = QLineEdit()
+        self._jobs_search_input.setPlaceholderText("Search title, company, description, location...")
+        self._jobs_search_button = QPushButton("Search")
+        self._jobs_clear_search_button = QPushButton("Clear")
+        self._jobs_limit_input = QSpinBox()
+        self._jobs_limit_input.setRange(50, 5000)
+        self._jobs_limit_input.setSingleStep(100)
+        self._jobs_limit_input.setValue(500)
+        self._jobs_results_label = QLabel("Showing: 0")
+        self._jobs_results_label.setProperty("role", "muted")
         self._jobs_count_label = QLabel("Jobs: 0 | Companies: 0")
         self._jobs_count_label.setProperty("role", "muted")
         self._runs_table = self._create_table(
@@ -540,10 +566,24 @@ class JobPipeMainWindow(QMainWindow):
         # Counts label
         counts_layout = QHBoxLayout()
         counts_layout.addWidget(self._jobs_count_label)
+        counts_layout.addWidget(self._jobs_results_label)
         counts_layout.addStretch(1)
         layout.addLayout(counts_layout)
 
         controls = QHBoxLayout()
+        controls.addWidget(QLabel("Search:"))
+        controls.addWidget(self._jobs_search_input, 1)
+        self._jobs_search_input.returnPressed.connect(self.refresh_views)
+
+        self._jobs_search_button.clicked.connect(self.refresh_views)
+        controls.addWidget(self._jobs_search_button)
+
+        self._jobs_clear_search_button.clicked.connect(self._clear_job_search)
+        controls.addWidget(self._jobs_clear_search_button)
+
+        controls.addWidget(QLabel("Limit:"))
+        controls.addWidget(self._jobs_limit_input)
+
         refresh_button = QPushButton("Refresh")
         refresh_button.clicked.connect(self.refresh_views)
         controls.addWidget(refresh_button)
@@ -576,14 +616,26 @@ class JobPipeMainWindow(QMainWindow):
         details_layout.addWidget(self._job_details_text)
 
         splitter.addWidget(details_panel)
-        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 1)
         layout.addWidget(splitter)
 
         # Connect selection change to show details
         self._jobs_table.selectionModel().selectionChanged.connect(self._on_job_selection_changed)
 
+        # Add context menu for copy
+        self._jobs_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._jobs_table.customContextMenuRequested.connect(self._show_jobs_context_menu)
+
+        # Add Ctrl+C shortcut for copy
+        copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self._jobs_table)
+        copy_shortcut.activated.connect(self._copy_selected_jobs)
+
         return widget
+
+    def _clear_job_search(self) -> None:
+        self._jobs_search_input.clear()
+        self.refresh_views()
 
     def _build_runs_tab(self) -> QWidget:
         widget = QWidget()
@@ -852,7 +904,7 @@ class JobPipeMainWindow(QMainWindow):
     def _build_resume_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
 
         self._resume_job_id_input.setPlaceholderText("Optional explicit job id")
         self._resume_min_score_input.setPlaceholderText("Defaults to notification threshold")
@@ -868,9 +920,34 @@ class JobPipeMainWindow(QMainWindow):
         form_card = QFrame()
         form_card.setProperty("role", "card")
         form_layout = QVBoxLayout(form_card)
-        form_layout.setContentsMargins(12, 10, 12, 10)
+        form_layout.setContentsMargins(12, 8, 12, 8)
         form_layout.addLayout(form)
         layout.addWidget(form_card)
+
+        # Quick AI Generation panel
+        ai_card = QFrame()
+        ai_card.setProperty("role", "card")
+        ai_layout = QVBoxLayout(ai_card)
+        ai_layout.setContentsMargins(12, 8, 12, 8)
+        ai_title = QLabel("AI Resume Generation (Phase C)")
+        ai_title.setObjectName("cardTitle")
+        ai_layout.addWidget(ai_title)
+
+        ai_desc = QLabel("Generates a targeted LaTeX resume for the selected job using Gemini API.")
+        ai_desc.setProperty("role", "muted")
+        ai_layout.addWidget(ai_desc)
+
+        ai_buttons = QHBoxLayout()
+        self._resume_gen_1page_button.setObjectName("primaryButton")
+        self._resume_gen_1page_button.clicked.connect(lambda: self._resume_generate_ai_clicked("1"))
+        ai_buttons.addWidget(self._resume_gen_1page_button)
+
+        self._resume_gen_halfpage_button.clicked.connect(lambda: self._resume_generate_ai_clicked("half"))
+        ai_buttons.addWidget(self._resume_gen_halfpage_button)
+
+        ai_buttons.addStretch(1)
+        ai_layout.addLayout(ai_buttons)
+        layout.addWidget(ai_card)
 
         controls = QHBoxLayout()
         self._resume_stage_button.clicked.connect(self._resume_stage_clicked)
@@ -880,10 +957,15 @@ class JobPipeMainWindow(QMainWindow):
         self._resume_approve_button.setObjectName("primaryButton")
         controls.addWidget(self._resume_stage_button)
         controls.addWidget(self._resume_compile_button)
-        controls.addWidget(self._resume_approve_button)  # New button
+        controls.addWidget(self._resume_approve_button)  # REQ-3.4
         controls.addWidget(self._resume_open_pdf_button)
         controls.addStretch(1)
         layout.addLayout(controls)
+
+        # Job context info (populated when staging or generating)
+        self._resume_context_label = QLabel("No job selected")
+        self._resume_context_label.setProperty("role", "muted")
+        layout.addWidget(self._resume_context_label)
 
         # LaTeX editor (REQ-3.3)
         editor_label = QLabel("LaTeX Resume Editor:")
@@ -917,7 +999,7 @@ class JobPipeMainWindow(QMainWindow):
         table.setHorizontalHeaderLabels(headers)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         table.setAlternatingRowColors(True)
         table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(28)
@@ -941,8 +1023,11 @@ class JobPipeMainWindow(QMainWindow):
     def refresh_views(self) -> None:
         try:
             snapshot = self._service.dashboard_snapshot()
-            jobs = self._service.list_top_jobs(limit=200)
-            self._populate_jobs(jobs)
+            search_query = self._jobs_search_input.text().strip() or None
+            jobs = self._service.list_jobs(
+                limit=self._jobs_limit_input.value(),
+                search_query=search_query,
+            )
             runs = self._service.list_recent_runs(limit=200)
             notifications = self._service.list_recent_notifications(limit=200)
             job_count, company_count = self._service.get_jobs_and_companies_count()
@@ -956,6 +1041,10 @@ class JobPipeMainWindow(QMainWindow):
         self._populate_runs(runs)
         self._populate_notifications(notifications)
         self._jobs_count_label.setText(f"Jobs: {job_count} | Companies: {company_count}")
+        search_text = search_query or "all jobs"
+        self._jobs_results_label.setText(
+            f"Showing {len(jobs)} of up to {self._jobs_limit_input.value()} for {search_text}"
+        )
 
         self.statusBar().showMessage("Data refreshed", 3000)
         self._append_log("UI data refreshed")
@@ -1021,6 +1110,8 @@ class JobPipeMainWindow(QMainWindow):
             for column, text in enumerate(values):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                if column == 4:
+                    item.setData(Qt.ItemDataRole.UserRole, job.id)
                 # Add tooltip with full date if using posted_ago
                 if column == 8 and job.posted_ago:  # Posted column
                     item.setToolTip(_format_datetime(job.date_posted))
@@ -1032,6 +1123,8 @@ class JobPipeMainWindow(QMainWindow):
 
         self._jobs_table.resizeColumnsToContents()
         self._jobs_table.setSortingEnabled(True)
+        # Sort by Total score (column 0) descending by default
+        self._jobs_table.sortItems(0, Qt.SortOrder.DescendingOrder)
 
     def _populate_runs(self, runs: list) -> None:
         self._runs_table.setSortingEnabled(False)
@@ -1103,7 +1196,39 @@ class JobPipeMainWindow(QMainWindow):
             QMessageBox.warning(self, "Open Failed", f"Could not open URL: {url}")
             return
 
-        self._append_log(f"Opened URL: {url}")
+        # Start enrichment polling for this job
+        title_item = self._jobs_table.item(row, 4)
+        if title_item:
+            job_id = title_item.data(Qt.ItemDataRole.UserRole)
+            if job_id:
+                self._start_enrichment_polling(str(job_id), row)
+
+        self._append_log(f"Opened URL: {url}, monitoring enrichment...")
+
+    def _copy_selected_jobs(self) -> None:
+        """Copy selected jobs to clipboard as tab-separated values."""
+        selected_rows = self._jobs_table.selectionModel().selectedRows()
+        if not selected_rows:
+            return
+
+        rows_data = []
+        headers = []
+        for col in range(self._jobs_table.columnCount()):
+            header = self._jobs_table.horizontalHeaderItem(col)
+            headers.append(header.text() if header else f"Column {col}")
+
+        rows_data.append("\t".join(headers))
+
+        for row_index in sorted([r.row() for r in selected_rows]):
+            row_data = []
+            for col in range(self._jobs_table.columnCount()):
+                item = self._jobs_table.item(row_index, col)
+                row_data.append(item.text() if item else "")
+            rows_data.append("\t".join(row_data))
+
+        clipboard_text = "\n".join(rows_data)
+        QApplication.clipboard().setText(clipboard_text)
+        self._append_log(f"Copied {len(selected_rows)} job(s) to clipboard")
 
     def _on_job_selection_changed(self) -> None:
         selected = self._jobs_table.selectionModel().selectedRows()
@@ -1127,16 +1252,28 @@ class JobPipeMainWindow(QMainWindow):
             details.append(f"URL: {url_item.text()}")
         
         # Get the full job record to show all details
-        url = url_item.text().strip() if url_item else ""
-        if url:
-            snapshot = self._service.snapshot()
-            matching_jobs = [j for j in snapshot.jobs if j.url == url]
-            if matching_jobs:
-                job = matching_jobs[0]
+        job_id = title_item.data(Qt.ItemDataRole.UserRole) if title_item else None
+        if job_id:
+            job = self._service.get_job_by_id(str(job_id))
+            if job is not None:
+                # Show description first (most important)
+                if job.description and len(job.description.strip()) > 0:
+                    desc = job.description.strip()
+                    details.append(f"\n--- Description ({len(desc)} chars) ---")
+                    if len(desc) > 1000:
+                        details.append(desc[:1000] + "...\n(truncated, full text in DB)")
+                    else:
+                        details.append(desc)
+                else:
+                    details.append("\n--- Description: (empty) ---")
                 if job.summary:
-                    details.append(f"\nSummary: {job.summary[:200]}..." if len(job.summary) > 200 else f"\nSummary: {job.summary}")
+                    details.append(
+                        f"\nSummary: {job.summary[:200]}..." if len(job.summary) > 200 else f"\nSummary: {job.summary}"
+                    )
                 if job.requirements:
-                    details.append(f"\nRequirements: {job.requirements[:200]}..." if len(job.requirements) > 200 else f"\nRequirements: {job.requirements}")
+                    details.append(
+                        f"\nRequirements: {job.requirements[:200]}..." if len(job.requirements) > 200 else f"\nRequirements: {job.requirements}"
+                    )
                 if job.location:
                     details.append(f"Location: {job.location}")
                 if job.county:
@@ -1163,6 +1300,206 @@ class JobPipeMainWindow(QMainWindow):
                     details.append(f"Applications: {job.applications}")
         
         self._job_details_text.setPlainText("\n".join(details))
+
+    # ==================== ENRICHMENT POLLING ====================
+
+    def _start_enrichment_polling(self, job_id: str, row: int) -> None:
+        """Start polling the database for job enrichment status."""
+        self._enrichment_job_id = job_id
+        self._enrichment_job_row = row
+        self._enrichment_poll_count = 0
+        self._enrichment_poll_timer.start()
+        self._append_log(f"Started enrichment polling for job: {job_id}")
+
+    def _check_enrichment_status(self) -> None:
+        """Check if the job has been enriched (poll callback)."""
+        self._enrichment_poll_count += 1
+        if self._enrichment_job_id is None:
+            self._enrichment_poll_timer.stop()
+            return
+
+        try:
+            enriched = self._service.poll_job_enrichment(self._enrichment_job_id)
+            if enriched:
+                self._on_enrichment_detected()
+                return
+        except Exception as exc:
+            self._append_log(f"Enrichment poll error: {exc}")
+
+        # Check timeout
+        if self._enrichment_poll_count >= self._enrichment_poll_max:
+            self._enrichment_poll_timer.stop()
+            self._append_log(
+                f"Enrichment polling timed out for job {self._enrichment_job_id}. "
+                "The extension may not have auto-scraped. Try the popup 'Capture' button."
+            )
+            self.statusBar().showMessage(
+                "Enrichment check timed out — extension may not be active on that page", 5000
+            )
+            self._enrichment_job_id = None
+            self._enrichment_job_row = None
+
+    def _on_enrichment_detected(self) -> None:
+        """Handle successful enrichment detection."""
+        self._enrichment_poll_timer.stop()
+
+        # Update the status cell in the jobs table
+        if self._enrichment_job_row is not None:
+            row = self._enrichment_job_row
+            status_item = self._jobs_table.item(row, 7)  # Status column
+            if status_item:
+                current_status = status_item.text().strip()
+                if "Enriched" not in current_status:
+                    status_item.setText(f"{current_status} ✓Enriched")
+
+        self._append_log(f"Job {self._enrichment_job_id} enriched successfully!")
+        self.statusBar().showMessage("Job data enriched from detail page ✓", 5000)
+        self.refresh_views()
+        self._enrichment_job_id = None
+        self._enrichment_job_row = None
+
+    # ==================== RESUME GENERATION ====================
+
+    def _generate_resume_for_selected_job(self) -> None:
+        """Right-click handler: generate a resume for the selected job."""
+        selected = self._jobs_table.selectionModel().selectedRows()
+        if not selected:
+            QMessageBox.information(self, "No Job Selected", "Select a job row first.")
+            return
+
+        row = selected[0].row()
+        title_item = self._jobs_table.item(row, 4)
+        company_item = self._jobs_table.item(row, 5)
+        if not title_item:
+            QMessageBox.warning(self, "Missing Data", "Selected row has no job data.")
+            return
+
+        job_id = title_item.data(Qt.ItemDataRole.UserRole)
+        if not job_id:
+            QMessageBox.warning(self, "Missing Job ID", "Selected row has no job ID.")
+            return
+
+        company = company_item.text().strip() if company_item else "Unknown"
+        title = title_item.text().strip()
+
+        # Switch to Resume tab and pre-populate
+        tabs = self.findChild(QTabWidget, "mainTabs")
+        if tabs:
+            # Find the Resume tab index (usually 4)
+            for i in range(tabs.count()):
+                if "Resume" in tabs.tabText(i) and "Variant" not in tabs.tabText(i):
+                    tabs.setCurrentIndex(i)
+                    break
+
+        # Pre-populate the job ID field
+        self._resume_job_id_input.setText(str(job_id))
+
+        # Auto-stage the job description
+        self._append_log(f"Generating resume for: {title} at {company} (job_id={job_id})")
+        self._resume_stage_clicked()
+
+    def _resume_generate_ai_clicked(self, max_pages: str = "1") -> None:
+        """Generate a resume via AI for the currently staged job."""
+        latex_content = self._resume_preview.get_latex_content()
+        if latex_content.strip() and latex_content.strip().startswith("\\documentclass"):
+            reply = QMessageBox.question(
+                self,
+                "Overwrite Resume?",
+                "There's already a resume in the editor. Generate a new one and overwrite?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        job_id = self._resume_job_id_input.text().strip()
+        if not job_id:
+            QMessageBox.warning(self, "No Job", "Enter or select a Job ID first.")
+            return
+
+        page_label = "1/2-page" if max_pages == "half" else "1-page"
+
+        def do_generate() -> dict:
+            return self._service.generate_resume_content(
+                job_id=job_id, max_pages=max_pages,
+            )
+
+        self._start_resume_action(
+            action_name=f"AI Generate ({page_label})",
+            fn=do_generate,
+            success_handler=lambda result: self._resume_ai_generate_succeeded(result, page_label),
+        )
+
+    def _resume_ai_generate_succeeded(self, result: object, page_label: str) -> None:
+        """Handle successful AI resume generation."""
+        result_dict = dict(result)  # Convert from dict-like to dict
+        tex_path = result_dict.get("tex_path", "")
+        title = result_dict.get("title", "Unknown")
+        company = result_dict.get("company", "Unknown")
+
+        # Load the generated LaTeX into the editor
+        if tex_path:
+            tex_path_obj = Path(tex_path)
+            if tex_path_obj.exists():
+                self._resume_preview.load_file(tex_path_obj)
+                self._resume_tex_path_input.setText(str(tex_path_obj))
+
+        self._resume_status_value.setText(f"AI Generated ({page_label})")
+        self._append_log(
+            f"AI resume generated for {title} at {company} | tex={tex_path}"
+        )
+        self.statusBar().showMessage(f"AI {page_label} resume generated ✓", 5000)
+
+    def _show_jobs_context_menu(self, position) -> None:
+        """Show context menu for jobs table."""
+        selected = self._jobs_table.selectionModel().selectedRows()
+        if not selected:
+            return
+
+        menu = QMenu(self)
+        copy_action = QAction("Copy Selected Rows", self)
+        copy_action.triggered.connect(self._copy_selected_jobs)
+        menu.addAction(copy_action)
+
+        menu.addSeparator()
+
+        resume_action = QAction("Generate Resume for Selected Job", self)
+        resume_action.triggered.connect(self._generate_resume_for_selected_job)
+        menu.addAction(resume_action)
+
+        resume_half_action = QAction("Generate 1/2-Page Resume (AI)", self)
+        resume_half_action.triggered.connect(
+            lambda: self._generate_resume_ai_for_job_from_context_menu("half")
+        )
+        menu.addAction(resume_half_action)
+
+        menu.exec(self._jobs_table.viewport().mapToGlobal(position))
+
+    def _generate_resume_ai_for_job_from_context_menu(self, max_pages: str) -> None:
+        """Generate an AI resume directly from context menu."""
+        selected = self._jobs_table.selectionModel().selectedRows()
+        if not selected:
+            return
+
+        row = selected[0].row()
+        title_item = self._jobs_table.item(row, 4)
+        if not title_item:
+            return
+
+        job_id = title_item.data(Qt.ItemDataRole.UserRole)
+        if not job_id:
+            return
+
+        # Pre-populate and trigger AI generation
+        self._resume_job_id_input.setText(str(job_id))
+
+        tabs = self.findChild(QTabWidget, "mainTabs")
+        if tabs:
+            for i in range(tabs.count()):
+                if "Resume" in tabs.tabText(i) and "Variant" not in tabs.tabText(i):
+                    tabs.setCurrentIndex(i)
+                    break
+
+        self._resume_generate_ai_clicked(max_pages=max_pages)
 
     def _clear_jobs(self) -> None:
         """Clear all jobs from the database after user confirmation."""
@@ -1345,6 +1682,7 @@ class JobPipeMainWindow(QMainWindow):
         title = getattr(result, "title", "unknown")
         company = getattr(result, "company", "unknown")
         self._resume_status_value.setText("Staged")
+        self._resume_context_label.setText(f"Job: {title} at {company} | Score: {score_text}")
         self._append_log(
             f"Resume target staged | title={title} company={company} score={score_text}"
         )

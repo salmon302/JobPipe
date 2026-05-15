@@ -109,14 +109,14 @@ class Settings:
     remote_preference: bool | None = None
     # Gemini API settings
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-1.5-flash"
+    gemini_model: str = "gemini-flash-latest"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     gemini_timeout_seconds: int = 60
     gemini_max_retries: int = 3
     gemini_retry_delay_seconds: float = 1.0
     # Resume variant system settings
     resume_variants_dir: Path = Path("data/resume_variants")
-    ats_optimization_model: str = "gemini-1.5-flash"
+    ats_optimization_model: str = "gemini-flash-latest"
     master_cv_hash_algorithm: str = "sha256"
 
     @classmethod
@@ -183,7 +183,7 @@ class Settings:
             ),
             # Gemini API settings
             gemini_api_key=getenv("JOBPIPE_GEMINI_API_KEY") or None,
-            gemini_model=getenv("JOBPIPE_GEMINI_MODEL", "gemini-1.5-flash"),
+            gemini_model=getenv("JOBPIPE_GEMINI_MODEL", "gemini-flash-latest"),
             gemini_base_url=getenv(
                 "JOBPIPE_GEMINI_BASE_URL",
                 "https://generativelanguage.googleapis.com/v1beta",
