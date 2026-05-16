@@ -152,7 +152,7 @@ class Settings:
             user_years_experience=_as_int(getenv("JOBPIPE_USER_YEARS_EXPERIENCE"), 1),
             notification_threshold=_as_float(
                 getenv("JOBPIPE_NOTIFICATION_THRESHOLD"),
-                0.80,
+                0.0,
             ),
             auto_stage_job_description=_as_bool(
                 getenv("JOBPIPE_AUTO_STAGE_JOB_DESCRIPTION"),

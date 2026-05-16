@@ -305,8 +305,8 @@ class JobPipeMainWindow(QMainWindow):
 
         # --- Job Preferences (moved from Settings tab) ---
         self._filter_notification_threshold = QLineEdit()
-        self._filter_notification_threshold.setPlaceholderText("0.80")
-        self._filter_notification_threshold.setText("0.80")  # Minimal default
+        self._filter_notification_threshold.setPlaceholderText("0.00")
+        self._filter_notification_threshold.setText("0.00")  # No minimum by default
         self._filter_user_years = QLineEdit()
         self._filter_user_years.setPlaceholderText("1")
         self._filter_user_years.setText("1")  # Minimal default
@@ -345,7 +345,7 @@ class JobPipeMainWindow(QMainWindow):
 
         # --- Job Preferences (moved from Settings tab) ---
         self._filter_notification_threshold = QLineEdit()
-        self._filter_notification_threshold.setPlaceholderText("0.80")
+        self._filter_notification_threshold.setPlaceholderText("0.00")
         self._filter_user_years = QLineEdit()
         self._filter_user_years.setPlaceholderText("1")
         self._filter_critical_skills = QLineEdit()
@@ -1655,7 +1655,7 @@ class JobPipeMainWindow(QMainWindow):
         # This ensures the service uses these values when scoring
         try:
             # Update scoring weights in settings
-            self._service.settings.notification_threshold = float(self._filter_notification_threshold.text() or "0.80")
+            self._service.settings.notification_threshold = float(self._filter_notification_threshold.text() or "0.0")
             self._service.settings.user_years_experience = int(self._filter_user_years.text() or "1")
             self._service.settings.critical_skills = self._filter_critical_skills.text() or "python,fastapi,sql,aws"
             self._service.settings.reject_terms = self._filter_reject_terms.text() or "senior,staff,principal,architect"
@@ -1679,7 +1679,7 @@ class JobPipeMainWindow(QMainWindow):
         self._filter_min_attainability.setValue(0)
         
         # Reset job preferences to minimal defaults
-        self._filter_notification_threshold.setText("0.80")
+        self._filter_notification_threshold.setText("0.00")
         self._filter_user_years.setText("1")
         self._filter_critical_skills.clear()
         self._filter_reject_terms.clear()
@@ -2445,7 +2445,7 @@ class JobPipeMainWindow(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "Invalid Minimum Score",
-                    "Minimum score must be a valid number (for example 0.80).",
+                    "Minimum score must be a valid number (for example 0.00).",
                 )
                 return
 

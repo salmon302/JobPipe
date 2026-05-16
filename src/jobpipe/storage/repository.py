@@ -298,13 +298,20 @@ class JobRepository:
                 except Exception:
                     LOGGER.info("upsert_jobs | Could not fetch sample existing rows")
 
+            # Deduplicate jobs by ID for the actual INSERT/UPDATE.
+            # The counting loop above may count duplicates as "updated",
+            # but passing them to executemany would cause a UNIQUE constraint
+            # failure on jobs.id when two jobs share the same ID but have
+            # different (platform, url) pairs.
             seen_ids: set[str] = set()
+            unique_jobs: list[JobRecord] = []
             for job in jobs:
                 if job.id in existing_ids or job.id in seen_ids:
                     updated += 1
                 else:
                     inserted += 1
                     seen_ids.add(job.id)
+                    unique_jobs.append(job)
 
             conn.executemany(
                 """
@@ -381,7 +388,7 @@ class JobRepository:
                         job.posted_at,
                         job.posted_ago,
                     )
-                    for job in jobs
+                    for job in unique_jobs
                 ],
             )
             conn.commit()
