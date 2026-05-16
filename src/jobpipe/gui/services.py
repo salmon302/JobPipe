@@ -598,25 +598,53 @@ class JobPipeGuiService:
     # -------------------------------------------------------------------------
     # Job Enrichment Polling
     # -------------------------------------------------------------------------
-    def poll_job_enrichment(self, job_id: str) -> bool:
+    def poll_job_enrichment(self, job_id: str, initial_desc_length: int = 200) -> bool:
         """Check if a job has been enriched with a substantive description.
 
         After opening a job URL in the browser, the extension auto-scrapes
         and enriches the detail page. This method checks if the description
-        is now >200 characters (indicating enrichment succeeded).
+        has grown to at least 500 chars AND is significantly larger than
+        the initial scrape snapshot (to avoid false-positives when the
+        search-result description already exceeds the old 200-char threshold).
 
         Args:
             job_id: The job ID to check.
+            initial_desc_length: The description length when polling started.
+                Only returns True if the current description exceeds this
+                by at least 300 chars (indicating real enrichment data arrived).
 
         Returns:
-            True if the job has a substantive description, False otherwise.
+            True if the job has been enriched with a fuller description.
         """
         self._prepare()
         repository = self._repository()
         job = repository.get_job_by_id(job_id)
         if job is None:
+            LOGGER.debug("poll_job_enrichment: job %s not found", job_id)
             return False
-        return bool(job.description and len(job.description.strip()) > 200)
+        if not job.description:
+            return False
+
+        current_len = len(job.description.strip())
+        # Require both a reasonable minimum size AND meaningful growth
+        result = current_len >= 500 and current_len >= initial_desc_length + 300
+
+        # Also consider it enriched if the description contains the job title
+        # (indicates the real job description, not just metadata)
+        if not result and job.title:
+            title_lower = job.title.lower()
+            desc_lower = job.description.lower()
+            # Check if a meaningful portion of the title appears in the description
+            title_words = [w for w in title_lower.split() if len(w) > 3]
+            if title_words and any(w in desc_lower for w in title_words[:3]):
+                # Title appears in description — likely the real description
+                result = current_len >= 400
+
+        LOGGER.debug(
+            "poll_job_enrichment: job_id=%s, current_len=%d, initial_len=%d, result=%s",
+            job_id, current_len, initial_desc_length, result
+        )
+        return result
 
     # -------------------------------------------------------------------------
     # AI Recommendations

@@ -128,9 +128,40 @@ User request:
    - "AI recommendations received successfully"
    - "AI panel visible: True"
    - "AI panel size: 300x500" (or similar)
+   - "AI panel isHidden: False"
    - "Splitter sizes before: [200, 800, 0]"
    - "Splitter sizes after: [200, 500, 300]"
+   - "Splitter widget count: 3"
 3. **Click "AI Recommend"** - The right panel should now appear with recommendations
+
+## 9. Enhanced Debugging (2026-05-16 09:00)
+### Additional Fixes Applied:
+1. Added `self._ai_panel.paint()` to force repaint after showing
+2. Added `self._ai_panel.isHidden()` logging to check hidden state
+3. Added auto-expand logic: if panel is collapsed (▶), auto-click to expand
+4. Enhanced `_force_splitter_show_panel()`:
+   - Added `splitter.refresh()` to force refresh
+   - Added widget count logging: `f"Splitter widget count: {splitter.count()}"`
+   - Added warning if splitter doesn't have 3 widgets
+
+### Debug Logging Added:
+- `f"AI panel isHidden: {self._ai_panel.isHidden()}"` - Checks hidden state
+- `f"Splitter widget count: {splitter.count()}"` - Verifies splitter has 3 widgets
+- `f"Warning: Splitter has {splitter.count()} widgets, expected 3"` - Alerts if structure is wrong
+
+### Files Modified:
+- `src/jobpipe/gui/app.py`:
+  - `_on_recommend_finished()`: Added `paint()`, `isHidden()` check, auto-expand logic (lines ~1800-1820)
+  - `_force_splitter_show_panel()`: Added `refresh()`, widget count logging (lines ~1930-1980)  - `AIRecommendPanel.update_recommendations()`: Now ensures text display and picks list are visible
+
+### Latest Fix (2026-05-16 09:30):
+- **Issue**: Panel text display and picks list were hidden by collapse toggle
+- **Fix**: Added `setVisible(True)` for both widgets in `update_recommendations()`
+- **Additional**: Reset collapse button text to "◀" (expanded state) when updating
+### Verification:
+- ✅ All 11 GUI service tests pass
+- ✅ Syntax check passed
+- ✅ Enhanced logging will show exact state in GUI log area
 
 ## 7. Database Fix (2026-05-15 19:45)
 ### Issue: `sqlite3.IntegrityError: UNIQUE constraint failed: jobs.id`

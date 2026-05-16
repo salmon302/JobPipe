@@ -1,21 +1,24 @@
 # Job Description
 
-- Job ID: hiringcafe-utipro___opensignal___COM1506COMNI___19c82d62-744d-4052-b76b-df5ebcc9aa51___3a9613e3-7de2-4890-bdb2-9cdf581b9cbe
+- Job ID: hiringcafe-grnhse___technergetics___4681908006
 - Platform: HiringCafe
-- Title: Junior Data Engineer
-- Company: Opensignal
-- URL: https://opensignal.rec.pro.ukg.net/COM1506COMNI/JobBoard/19c82d62-744d-4052-b76b-df5ebcc9aa51/OpportunityDetail?opportunityId=3a9613e3-7de2-4890-bdb2-9cdf581b9cbe
-- Date Posted (UTC): 2026-05-14T18:04:29.923000+00:00
-- Match Score: 0.741
-- Status: Queued
-- Years Required: 1
-- Remote: on-site/hybrid
+- Title: R&D Engineering Intern
+- Company: Technergetics
+- URL: https://job-boards.greenhouse.io/technergetics/jobs/4681908006
+- Date Posted (UTC): 2026-05-15T13:40:41+00:00
+- Match Score: 0.516
+- Status: Notified
+- Years Required: n/a
+- Remote: remote
 
 ## Raw Description
 
-1+ years in building big data pipelines; Spark/Scala/SQL experience; AWS; Bachelor’s degree.
-Location: London or Boston or Victoria
-Compensation: CA$70,000-CA$85,000/yr
-Workplace: Hybrid
-Employment: Full Time
-Department: Information Technology
+Internship requiring Master’s or late-stage BS in computer/electrical engineering; embedded skills; C/C++/Python; remote work; US citizenship.
+Location: Rome or United States
+Compensation: $22-$28/hr
+Workplace: Remote
+Employment: Full Time, Internship
+Department: Research and Development (R&D)
+Views: 6
+Saves: 0
+Applications: 2

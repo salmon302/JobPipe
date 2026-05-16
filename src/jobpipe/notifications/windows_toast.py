@@ -1,12 +1,74 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ctypes
 import importlib
 import logging
+import threading
 import webbrowser
 from typing import Callable
 
 LOGGER = logging.getLogger(__name__)
+
+# Track patched instances to avoid double-patching
+_patched_notifiers: set[int] = set()
+
+
+def _patch_win10toast_click_wndproc() -> None:
+    """Monkey-patch win10toast_click WNDPROC to return proper LRESULT integers.
+
+    The library's _decorator method wraps wnd_proc but doesn't return the result.
+    Windows expects an integer (LRESULT), not None.
+    """
+    try:
+        import win10toast_click as _module
+        ToastNotifier = getattr(_module, "ToastNotifier", None)
+        if ToastNotifier is None:
+            return
+
+        # Patch the _decorator method to return the result of wnd_proc
+        original_decorator = getattr(ToastNotifier, "_decorator", None)
+        if original_decorator is None:
+            return
+
+        @staticmethod
+        def patched_decorator(func, callback=None):
+            def inner(*args, **kwargs):
+                kwargs.update({'callback': callback})
+                # The original doesn't return the result - that's the bug
+                result = func(*args, **kwargs)
+                # WNDPROC must return an integer (LRESULT), not None
+                if result is None:
+                    return 0
+                return result
+            return inner
+
+        ToastNotifier._decorator = patched_decorator
+        LOGGER.debug("Patched win10toast_click _decorator to return LRESULT")
+    except (ImportError, AttributeError) as exc:
+        LOGGER.debug("Could not patch win10toast_click: %s", exc)
+
+
+def _patch_notifier_instance(notifier) -> None:
+    """Patch a notifier instance to handle Shell_NotifyIcon errors gracefully."""
+    nid = getattr(notifier, "nid", None)
+    if nid is None:
+        return
+
+    # Patch on_destroy to handle Shell_NotifyIcon failure
+    original_on_destroy = getattr(notifier, "on_destroy", None)
+    if original_on_destroy is None:
+        return
+
+    def patched_on_destroy(hwnd, msg, wparam, lparam):
+        try:
+            return original_on_destroy(hwnd, msg, wparam, lparam)
+        except Exception as exc:
+            LOGGER.debug("Shell_NotifyIcon delete failed (suppressed): %s", exc)
+            return 0
+
+    notifier.on_destroy = patched_on_destroy
+    _patched_notifiers.add(id(notifier))
 
 
 @dataclass(frozen=True)
@@ -22,7 +84,12 @@ def _load_toast_backend() -> tuple[object | None, bool, str]:
     try:
         module = importlib.import_module("win10toast_click")
         notifier_cls = getattr(module, "ToastNotifier")
-        return notifier_cls(), True, "win10toast_click"
+        # Patch the class WNDPROC once at import time
+        _patch_win10toast_click_wndproc()
+        instance = notifier_cls()
+        # Patch this instance for Shell_NotifyIcon error handling
+        _patch_notifier_instance(instance)
+        return instance, True, "win10toast_click"
     except (ImportError, ModuleNotFoundError, AttributeError):
         pass
 

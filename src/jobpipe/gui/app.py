@@ -124,6 +124,15 @@ class RecommendWorker(QRunnable):
         self._top_jobs = top_jobs
         self.signals = RecommendSignals()
 
+    def run(self) -> None:
+        try:
+            recommendation = self._service.generate_ai_recommendations(self._top_jobs)
+            self.signals.succeeded.emit(recommendation)
+        except Exception as exc:
+            self.signals.failed.emit(str(exc))
+        finally:
+            self.signals.completed.emit()
+
 
 class AIRecommendPanel(QWidget):
     """Collapsible right sidebar panel for AI recommendations (Copilot style)."""
@@ -191,6 +200,15 @@ class AIRecommendPanel(QWidget):
         """Update the panel with new recommendations."""
         self._job_ids = job_ids
         self._text_display.setPlainText(text)
+        
+        # Ensure widgets are visible (they might be hidden by collapse toggle)
+        self._text_display.setVisible(True)
+        self._picks_list.setVisible(True)
+        
+        # Also ensure the collapse button shows "◀" (expanded state)
+        if hasattr(self, '_collapse_btn'):
+            self._collapse_btn.setText("◀")  # Set to expanded state
+            self._collapse_btn.setToolTip("Collapse panel")
 
         # Extract job titles from recommendations for the picks list
         picks = []
@@ -201,15 +219,6 @@ class AIRecommendPanel(QWidget):
     def get_job_ids(self) -> list[str]:
         """Return the list of AI-picked job IDs."""
         return self._job_ids
-
-    def run(self) -> None:
-        try:
-            recommendation = self._service.generate_ai_recommendations(self._top_jobs)
-            self.signals.succeeded.emit(recommendation)
-        except Exception as exc:
-            self.signals.failed.emit(str(exc))
-        finally:
-            self.signals.completed.emit()
 
 
 class JobPipeMainWindow(QMainWindow):
@@ -231,6 +240,7 @@ class JobPipeMainWindow(QMainWindow):
         self._enrichment_poll_max = 15  # ~30 seconds max
         self._enrichment_job_id: str | None = None
         self._enrichment_job_row: int | None = None
+        self._enrichment_initial_desc_length: int = 0
         self._pending_stage_after_enrichment: bool = False  # Flag for double-click staging
 
         # Auto-refresh timer for database updates
@@ -1397,6 +1407,16 @@ class JobPipeMainWindow(QMainWindow):
         job_details_layout = QVBoxLayout(job_details_group)
         job_details_layout.setContentsMargins(8, 6, 8, 6)
         
+        # Enrichment progress row
+        enrichment_row = QHBoxLayout()
+        enrichment_row.setSpacing(6)
+        self._resume_enrichment_label = QLabel("⏳ Enrichment: Waiting for extension...")
+        self._resume_enrichment_label.setProperty("role", "statusBadge")
+        self._resume_enrichment_label.setVisible(False)  # Hidden until a job is double-clicked
+        enrichment_row.addWidget(self._resume_enrichment_label)
+        enrichment_row.addStretch(1)
+        job_details_layout.addLayout(enrichment_row)
+        
         self._resume_job_details_text = QPlainTextEdit()
         self._resume_job_details_text.setReadOnly(True)
         self._resume_job_details_text.setPlaceholderText("Job details will appear here when a job is staged or selected...")
@@ -1803,11 +1823,19 @@ class JobPipeMainWindow(QMainWindow):
             self._ai_panel.setVisible(True)
             self._ai_panel.raise_()  # Bring panel to front
             self._ai_panel.update()  # Force UI update
+            self._ai_panel.repaint()  # Force repaint
             self._append_log(f"AI panel visible: {self._ai_panel.isVisible()}")
             self._append_log(f"AI panel size: {self._ai_panel.size().width()}x{self._ai_panel.size().height()}")
+            self._append_log(f"AI panel isHidden: {self._ai_panel.isHidden()}")
             
             # Force splitter to allocate space for the panel
             self._force_splitter_show_panel()
+            
+            # Additional check: ensure panel is not collapsed
+            if hasattr(self._ai_panel, '_collapse_btn'):
+                if self._ai_panel._collapse_btn.text() == "▶":  # If collapsed
+                    self._ai_panel._collapse_btn.click()  # Expand it
+                    self._append_log("Auto-expanded AI panel")
         
         # Highlight AI picks in the table
         self._highlight_ai_picks(top_job_ids)
@@ -1898,6 +1926,7 @@ class JobPipeMainWindow(QMainWindow):
     def _force_splitter_show_panel(self) -> None:
         """Force the splitter to allocate space for the AI panel."""
         if not hasattr(self, '_ai_panel'):
+            self._append_log("No _ai_panel found")
             return
 
         # Get the splitter
@@ -1909,14 +1938,20 @@ class JobPipeMainWindow(QMainWindow):
             # Get current sizes
             sizes = splitter.sizes()
             self._append_log(f"Splitter sizes before: {sizes}")
+            self._append_log(f"Splitter widget count: {splitter.count()}")
 
             # Ensure we have 3 widgets
-            if len(sizes) >= 3:
+            if splitter.count() >= 3:
                 total = sum(sizes)
                 # Allocate space: sidebar=200, middle=remaining, panel=300
                 new_sizes = [200, max(100, total - 500), 300]
                 splitter.setSizes(new_sizes)
+                splitter.refresh()  # Force refresh
                 self._append_log(f"Splitter sizes after: {splitter.sizes()}")
+            else:
+                self._append_log(f"Warning: Splitter has {splitter.count()} widgets, expected 3")
+        else:
+            self._append_log("Warning: Could not find splitter parent")
 
     def _populate_runs(self, runs: list) -> None:
         self._runs_table.setSortingEnabled(False)
@@ -2170,8 +2205,31 @@ class JobPipeMainWindow(QMainWindow):
         self._enrichment_job_id = job_id
         self._enrichment_job_row = row
         self._enrichment_poll_count = 0
+        # Capture the description length right now so we can detect real growth
+        self._enrichment_initial_desc_length = self._get_job_description_length(job_id)
         self._enrichment_poll_timer.start()
-        self._append_log(f"Started enrichment polling for job: {job_id}")
+        self._append_log(
+            f"Started enrichment polling for job: {job_id} "
+            f"(initial desc length={self._enrichment_initial_desc_length})"
+        )
+        # Show enrichment status on the Resume tab
+        self._resume_enrichment_label.setText(
+            f"⏳ Enrichment: Waiting for extension on the job page..."
+        )
+        self._resume_enrichment_label.setVisible(True)
+        self._resume_enrichment_label.setProperty("role", "statusBadge")
+        self._resume_enrichment_label.style().unpolish(self._resume_enrichment_label)
+        self._resume_enrichment_label.style().polish(self._resume_enrichment_label)
+
+    def _get_job_description_length(self, job_id: str) -> int:
+        """Get the current description length for a job."""
+        try:
+            job = self._service.get_job_by_id(job_id)
+            if job and job.description:
+                return len(job.description.strip())
+        except Exception:
+            pass
+        return 0
 
     def _check_enrichment_status(self) -> None:
         """Check if the job has been enriched (poll callback)."""
@@ -2181,7 +2239,10 @@ class JobPipeMainWindow(QMainWindow):
             return
 
         try:
-            enriched = self._service.poll_job_enrichment(self._enrichment_job_id)
+            enriched = self._service.poll_job_enrichment(
+                self._enrichment_job_id,
+                initial_desc_length=self._enrichment_initial_desc_length,
+            )
             if enriched:
                 self._append_log(f"Enrichment detected for job {self._enrichment_job_id}")
                 self._on_enrichment_detected()
@@ -2190,6 +2251,11 @@ class JobPipeMainWindow(QMainWindow):
                 # Log progress for debugging
                 if self._enrichment_poll_count % 5 == 0:  # Every 10 seconds
                     self._append_log(f"Still waiting for enrichment... (poll {self._enrichment_poll_count}/{self._enrichment_poll_max})")
+                    # Update the Resume tab enrichment indicator so user knows it's still working
+                    elapsed = self._enrichment_poll_count * 2  # 2s interval
+                    self._resume_enrichment_label.setText(
+                        f"⏳ Enrichment: Still waiting on job page... ({elapsed}s elapsed)"
+                    )
         except Exception as exc:
             self._append_log(f"Enrichment poll error: {exc}")
 
@@ -2203,12 +2269,24 @@ class JobPipeMainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Enrichment check timed out — extension may not be active on that page", 5000
             )
+            self._resume_enrichment_label.setText(
+                f"⚠️ Enrichment: Timed out — try the browser extension popup Capture button"
+            )
+            self._resume_enrichment_label.setProperty("role", "statusBadge")
+            self._resume_enrichment_label.style().unpolish(self._resume_enrichment_label)
+            self._resume_enrichment_label.style().polish(self._resume_enrichment_label)
             self._enrichment_job_id = None
             self._enrichment_job_row = None
 
     def _on_enrichment_detected(self) -> None:
         """Handle successful enrichment detection."""
         self._enrichment_poll_timer.stop()
+
+        # Show success on the Resume tab enrichment indicator
+        self._resume_enrichment_label.setText("✅ Enrichment: Complete! Full description loaded.")
+        self._resume_enrichment_label.setProperty("role", "statusBadge")
+        self._resume_enrichment_label.style().unpolish(self._resume_enrichment_label)
+        self._resume_enrichment_label.style().polish(self._resume_enrichment_label)
 
         # Update the status cell in the jobs table
         if self._enrichment_job_row is not None:
@@ -2218,6 +2296,12 @@ class JobPipeMainWindow(QMainWindow):
                 current_status = status_item.text().strip()
                 if "Enriched" not in current_status:
                     status_item.setText(f"{current_status} ✓Enriched")
+
+        # Immediately refresh the "Job Details for AI" field on the Resume tab
+        # so the user sees the enriched description right away, even before
+        # the auto-stage background action completes.
+        if self._enrichment_job_id is not None:
+            self._update_resume_job_details(self._enrichment_job_id)
 
         self._append_log(f"Job {self._enrichment_job_id} enriched successfully!")
         self.statusBar().showMessage("Job data enriched from detail page ✓", 5000)
