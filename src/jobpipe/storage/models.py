@@ -49,6 +49,7 @@ class JobRecord:
     score_relevance: float | None = None
     score_attainability: float | None = None
     score_recency: float | None = None
+    last_scored_at: datetime | None = None
 
     @classmethod
     def from_row(cls, row: Row) -> "JobRecord":
@@ -88,6 +89,7 @@ class JobRecord:
             score_relevance=_row_value(row, "score_relevance"),
             score_attainability=_row_value(row, "score_attainability"),
             score_recency=_row_value(row, "score_recency"),
+            last_scored_at=_parse_datetime(_row_value(row, "last_scored_at")),
         )
 
 

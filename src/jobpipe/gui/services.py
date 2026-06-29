@@ -5,11 +5,15 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from os import environ
 from pathlib import Path
+from time import time
 
 from jobpipe.config import InvalidSettingsError, Settings
+
+_logger = logging.getLogger(__name__)
 from jobpipe.ingest.server import IngestServer, IngestServerConfig
 from jobpipe.ingest.service import JobIngestService
 from jobpipe.resume.compiler import LatexCompileConfig, LatexCompileResult, compile_latex
@@ -78,7 +82,7 @@ class JobPipeGuiService:
         initialize_database(self._settings.db_path)
 
     def _repository(self) -> JobRepository:
-        return JobRepository(self._settings.db_path)
+        return JobRepository(self._settings.db_path, self._settings)
 
     def dashboard_snapshot(self) -> DashboardSnapshot:
         self._prepare()
@@ -121,11 +125,32 @@ class JobPipeGuiService:
     def list_jobs(
         self,
         limit: int = 200,
+        offset: int = 0,
         search_query: str | None = None,
     ) -> list[JobRecord]:
+        """List jobs with pagination support.
+        
+        Args:
+            limit: Maximum number of jobs to return
+            offset: Number of jobs to skip (for pagination)
+            search_query: Optional search string
+        """
         self._prepare()
         repository = self._repository()
-        return repository.list_jobs(limit=limit, search_query=search_query)
+        return repository.list_jobs(
+            limit=limit,
+            offset=offset,
+            search_query=search_query,
+        )
+
+    def count_jobs(
+        self,
+        search_query: str | None = None,
+    ) -> int:
+        """Count total jobs for pagination."""
+        self._prepare()
+        repository = self._repository()
+        return repository.count_jobs(search_query=search_query)
 
     def get_job_by_id(self, job_id: str) -> JobRecord | None:
         self._prepare()
@@ -164,6 +189,190 @@ class JobPipeGuiService:
         self._prepare()
         repository = self._repository()
         return repository.list_recent_notifications(limit=limit)
+
+    def refresh_all_data(
+        self,
+        jobs_limit: int = 200,
+        jobs_offset: int = 0,
+        jobs_search: str | None = None,
+        runs_limit: int = 50,
+        notifications_limit: int = 50,
+    ) -> tuple[DashboardSnapshot, list[JobRecord], int, list[ScrapeRunRecord], list[NotificationAuditRecord], int, int]:
+        """Optimized batch refresh: fetch all dashboard data in a single connection.
+        
+        Returns:
+            (snapshot, jobs, total_jobs, runs, notifications, job_count, company_count)
+        """
+        _logger.debug("refresh_all_data() started")
+        start_time = time()
+        
+        self._prepare()
+        repository = self._repository()
+        
+        # Use a single connection for all queries
+        with connect(self._settings.db_path) as conn:
+            _logger.debug("Database connection established")
+            
+            # 1. Dashboard snapshot (aggregate counts)
+            _logger.debug("Querying dashboard snapshot...")
+            query_start = time()
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_jobs,
+                    SUM(CASE WHEN status = 'Queued' THEN 1 ELSE 0 END) AS queued_jobs,
+                    SUM(CASE WHEN status = 'Notified' THEN 1 ELSE 0 END) AS notified_jobs,
+                    SUM(
+                        CASE
+                            WHEN match_score IS NOT NULL AND match_score >= ?
+                            THEN 1
+                            ELSE 0
+                        END
+                    ) AS above_threshold_jobs
+                FROM jobs
+                """,
+                (self._settings.notification_threshold,),
+            ).fetchone()
+            _logger.debug(f"Dashboard snapshot query took {time() - query_start:.3f}s")
+            
+            # 2. Last run (single query)
+            _logger.debug("Querying last run...")
+            query_start = time()
+            run_row = conn.execute(
+                """
+                SELECT run_id, started_at, finished_at, status, scraped, inserted,
+                       updated, scored, above_threshold, notified, error_message
+                FROM scrape_runs
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+            ).fetchone()
+            _logger.debug(f"Last run query took {time() - query_start:.3f}s")
+            
+            last_run = None
+            if run_row:
+                last_run = ScrapeRunRecord.from_row(run_row)
+            
+            _logger.debug("Building dashboard snapshot...")
+            snapshot = DashboardSnapshot(
+                total_jobs=int(row["total_jobs"] or 0),
+                queued_jobs=int(row["queued_jobs"] or 0),
+                notified_jobs=int(row["notified_jobs"] or 0),
+                above_threshold_jobs=int(row["above_threshold_jobs"] or 0),
+                last_run=last_run,
+            )
+            
+            _logger.debug(f"Dashboard snapshot built: {snapshot.total_jobs} total jobs")
+            
+            # 3. Jobs list with pagination
+            _logger.debug(f"Querying jobs list (limit={jobs_limit}, offset={jobs_offset})...")
+            query_start = time()
+            search = (jobs_search or "").strip()
+            if search:
+                tokens = [token for token in search.split() if token]
+                if tokens:
+                    escaped_tokens = [token.replace('"', '""') for token in tokens]
+                    fts_query = " AND ".join(f'"{token}"' for token in escaped_tokens)
+                    jobs_query = f"""
+                        SELECT {self._job_select_columns()}
+                        FROM jobs
+                        JOIN jobs_fts ON jobs_fts.rowid = jobs.rowid
+                        WHERE jobs_fts MATCH ?
+                        ORDER BY (jobs.match_score IS NULL), jobs.match_score DESC, jobs.date_posted DESC
+                        LIMIT ? OFFSET ?
+                    """
+                    jobs_rows = conn.execute(jobs_query, (fts_query, jobs_limit, jobs_offset)).fetchall()
+                else:
+                    jobs_query = f"""
+                        SELECT {self._job_select_columns()}
+                        FROM jobs
+                        ORDER BY (jobs.match_score IS NULL), jobs.match_score DESC, jobs.date_posted DESC
+                        LIMIT ? OFFSET ?
+                    """
+                    jobs_rows = conn.execute(jobs_query, (jobs_limit, jobs_offset)).fetchall()
+            else:
+                jobs_query = f"""
+                    SELECT {self._job_select_columns()}
+                    FROM jobs
+                    ORDER BY (jobs.match_score IS NULL), jobs.match_score DESC, jobs.date_posted DESC
+                    LIMIT ? OFFSET ?
+                """
+                jobs_rows = conn.execute(jobs_query, (jobs_limit, jobs_offset)).fetchall()
+            
+            jobs = [JobRecord.from_row(row) for row in jobs_rows]
+            _logger.debug(f"Jobs query took {time() - query_start:.3f}s, returned {len(jobs)} jobs")
+            
+            # 4. Total job count (reuse snapshot.total_jobs if no search)
+            if search:
+                count_row = conn.execute(
+                    """
+                    SELECT COUNT(*) as count
+                    FROM jobs
+                    JOIN jobs_fts ON jobs_fts.rowid = jobs.rowid
+                    WHERE jobs_fts MATCH ?
+                    """,
+                    (fts_query,) if search and 'fts_query' in locals() else (),
+                ).fetchone()
+                total_jobs = int(count_row["count"] or 0)
+            else:
+                total_jobs = snapshot.total_jobs
+            
+            _logger.debug(f"Total jobs: {total_jobs}")
+            
+            # 5. Recent runs (reduced limit)
+            _logger.debug(f"Querying recent runs (limit={runs_limit})...")
+            query_start = time()
+            runs_rows = conn.execute(
+                """
+                SELECT run_id, started_at, finished_at, status, scraped, inserted,
+                       updated, scored, above_threshold, notified, error_message
+                FROM scrape_runs
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                (runs_limit,),
+            ).fetchall()
+            _logger.debug(f"Runs query took {time() - query_start:.3f}s, returned {len(runs_rows)} runs")
+            runs = [ScrapeRunRecord.from_row(row) for row in runs_rows]
+            
+            # 6. Recent notifications (reduced limit)
+            _logger.debug(f"Querying notifications (limit={notifications_limit})...")
+            notif_rows = conn.execute(
+                """
+                SELECT notification_id, run_id, job_id, title, company, score, url,
+                       delivery_status, error_message, notified_at
+                FROM notifications_audit
+                ORDER BY notified_at DESC
+                LIMIT ?
+                """,
+                (notifications_limit,),
+            ).fetchall()
+            notifications = [NotificationAuditRecord.from_row(row) for row in notif_rows]
+            
+            # 7. Unique counts
+            counts_row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS job_count,
+                    COUNT(DISTINCT company) AS company_count
+                FROM jobs
+                """
+            ).fetchone()
+            job_count = int(counts_row["job_count"] or 0)
+            company_count = int(counts_row["company_count"] or 0)
+        
+        return (snapshot, jobs, total_jobs, runs, notifications, job_count, company_count)
+    
+    def _job_select_columns(self) -> str:
+        """Return column list for job queries."""
+        return """
+            id, platform, title, company, url, description, date_posted,
+            match_score, status, years_required, is_remote,
+            score_relevance, score_attainability, score_recency,
+            summary, requirements, location, county, compensation,
+            workplace_type, employment_type, department, team,
+            views, saves, applications, posted_at, posted_ago
+        """
 
     def rescore_all_jobs(self) -> int:
         """Re-score all jobs using current Master CV. Returns number of jobs scored."""
@@ -650,7 +859,7 @@ class JobPipeGuiService:
     # AI Recommendations
     # -------------------------------------------------------------------------
 
-    def generate_ai_recommendations(self, top_jobs: list[JobRecord]) -> str:
+    def generate_ai_recommendations(self, top_jobs: list[JobRecord]) -> tuple[str, list[str]]:
         """Generate AI recommendations for job application priorities.
 
         Uses Gemini API to analyze top-scoring jobs against the Master CV
@@ -660,7 +869,8 @@ class JobPipeGuiService:
             top_jobs: List of top-scoring JobRecord objects (top 20%).
 
         Returns:
-            AI-generated recommendation text.
+            Tuple of (AI-generated recommendation text, priority levels list).
+            Priority levels are 'high', 'medium', or 'low' for each recommendation.
 
         Raises:
             RuntimeError: If Gemini key is not configured or generation fails.
@@ -716,7 +926,22 @@ Provide a brief intro (1 sentence), then bullet points with priorities. Be conci
         # Create Gemini client and generate text
         try:
             client = create_gemini_client_from_settings(self._settings)
-            return client.generate_text(prompt, temperature=0.3, max_output_tokens=1024)
+            recommendation = client.generate_text(prompt, temperature=0.3, max_output_tokens=1024)
+            
+            # Determine priority levels based on job scores
+            priority_levels = []
+            for job in top_jobs[:5]:
+                if job.match_score:
+                    if job.match_score >= 0.8:
+                        priority_levels.append("high")
+                    elif job.match_score >= 0.6:
+                        priority_levels.append("medium")
+                    else:
+                        priority_levels.append("low")
+                else:
+                    priority_levels.append("medium")  # Default
+            
+            return recommendation, priority_levels
         except GeminiAPIError as exc:
             raise RuntimeError(f"AI recommendation failed: {exc}") from exc
 
@@ -825,3 +1050,84 @@ Provide a brief intro (1 sentence), then bullet points with priorities. Be conci
             "status": "generated",
             "message": f"Resume generated for {job.title} at {job.company}. Review and compile.",
         }
+
+    # -------------------------------------------------------------------------
+    # Score Confidence & Explanation
+    # -------------------------------------------------------------------------
+
+    def get_confidence_badge(self, match_score: float | None) -> tuple[str, str]:
+        """Get confidence badge emoji and tooltip for a match score.
+        
+        Args:
+            match_score: The job match score [0, 1] or None
+            
+        Returns:
+            Tuple of (badge_emoji, tooltip_text)
+        """
+        if match_score is None:
+            return "⚪", "Score pending calculation"
+        
+        if match_score >= 0.75:
+            return "🟢", "High confidence - strong match"
+        elif match_score >= 0.50:
+            return "🟡", "Medium confidence - reasonable match"
+        elif match_score > 0.0:
+            return "🔴", "Low confidence - weak match"
+        else:
+            return "⚫", "No match - rejected in pre-filter"
+
+    def explain_job_score_quick(
+        self,
+        job: JobRecord,
+    ) -> str:
+        """Generate a quick explanation for a job score (1-2 sentences).
+        
+        This is a fast, AI-assisted explanation. Uses Gemini API.
+        
+        Args:
+            job: The JobRecord to explain
+            
+        Returns:
+            Brief explanation text
+            
+        Raises:
+            RuntimeError: If Gemini is not configured
+        """
+        from jobpipe.resume.gemini_client import create_gemini_client_from_settings
+        
+        # Quick local explanation if score is None or very low
+        if job.match_score is None:
+            return "Score has not been calculated yet. Run scoring to evaluate this job."
+        
+        if job.match_score < 0.1:
+            return "Job was rejected by pre-filter criteria (e.g., too old, domain mismatch)."
+        
+        # Get AI explanation from Gemini
+        try:
+            client = create_gemini_client_from_settings(self._settings)
+            
+            # Build brief CV summary
+            master_cv_path = self._settings.master_cv_path
+            if master_cv_path.exists():
+                master_cv = master_cv_path.read_text(encoding="utf-8")
+                # Take first 300 chars for efficiency
+                cv_summary = master_cv[:300].replace("\n", " ")
+            else:
+                cv_summary = "No Master CV available"
+            
+            explanation = client.explain_job_score(
+                job_title=job.title,
+                company=job.company,
+                job_description=job.description or "",
+                master_cv_summary=cv_summary,
+                score_breakdown={
+                    "total": job.match_score or 0,
+                    "relevance": job.score_relevance or 0,
+                    "attainability": job.score_attainability or 0,
+                    "recency": job.score_recency or 0,
+                },
+            )
+            return explanation.strip()
+        except Exception as exc:
+            # Fallback to basic explanation
+            return f"AI explanation unavailable: {str(exc)[:50]}"

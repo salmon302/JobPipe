@@ -225,7 +225,8 @@ class TestE2EPipeline(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
 
             # Check database
-            repo = JobRepository(self.db_path)
+            settings = Settings.from_env()
+            repo = JobRepository(self.db_path, settings)
             jobs = repo.list_top_jobs(limit=10)
 
             self.assertEqual(len(jobs), 1)

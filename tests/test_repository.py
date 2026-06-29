@@ -14,7 +14,9 @@ def test_repository_upsert_and_fetch(tmp_path) -> None:
     db_path = tmp_path / "jobpipe.db"
     initialize_database(db_path)
 
-    repo = JobRepository(db_path)
+    from jobpipe.config import Settings
+    settings = Settings.from_env()
+    repo = JobRepository(db_path, settings)
     job = JobRecord(
         id="hiringcafe-123",
         platform="HiringCafe",
@@ -56,7 +58,9 @@ def test_repository_list_jobs_searches_full_dataset_and_includes_unscored(tmp_pa
     db_path = tmp_path / "jobpipe.db"
     initialize_database(db_path)
 
-    repo = JobRepository(db_path)
+    from jobpipe.config import Settings
+    settings = Settings.from_env()
+    repo = JobRepository(db_path, settings)
     scored = JobRecord(
         id="job-scored",
         platform="HiringCafe",
@@ -96,7 +100,9 @@ def test_notification_queue_and_mark_notified(tmp_path) -> None:
     db_path = tmp_path / "jobpipe.db"
     initialize_database(db_path)
 
-    repo = JobRepository(db_path)
+    from jobpipe.config import Settings
+    settings = Settings.from_env()
+    repo = JobRepository(db_path, settings)
     job = JobRecord(
         id="hiringcafe-124",
         platform="HiringCafe",

@@ -347,9 +347,12 @@ class JobIngestService:
         if len(jobs) > _MAX_JOBS_PER_REQUEST:
             raise IngestPayloadError("job batch exceeds max allowed size")
 
+        LOGGER.info("Calling process_ingest_batch with %d jobs", len(jobs))
         batch_result = process_ingest_batch(self._settings, jobs)
+        LOGGER.info("process_ingest_batch returned for run %s", batch_result.run_id)
         summary = batch_result.summary
 
+        LOGGER.info("Creating IngestResult for run %s", batch_result.run_id)
         return IngestResult(
             run_id=batch_result.run_id,
             ingested=summary.ingested,

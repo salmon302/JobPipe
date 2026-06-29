@@ -201,7 +201,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "top":
-        repository = JobRepository(settings.db_path)
+        repository = JobRepository(settings.db_path, settings)
         jobs = repository.list_top_jobs(limit=args.limit)
         for job in jobs:
             score = "n/a" if job.match_score is None else f"{job.match_score:.3f}"
@@ -209,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "runs":
-        repository = JobRepository(settings.db_path)
+        repository = JobRepository(settings.db_path, settings)
         runs = repository.list_recent_runs(limit=args.limit)
         for run in runs:
             finished = "in-progress" if run.finished_at is None else run.finished_at.isoformat()
@@ -225,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "notifications":
-        repository = JobRepository(settings.db_path)
+        repository = JobRepository(settings.db_path, settings)
         events = repository.list_recent_notifications(limit=args.limit)
         for event in events:
             score = "n/a" if event.score is None else f"{event.score:.3f}"
@@ -242,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "resume-stage":
-        repository = JobRepository(settings.db_path)
+        repository = JobRepository(settings.db_path, settings)
         minimum_score = (
             settings.notification_threshold if args.min_score is None else args.min_score
         )

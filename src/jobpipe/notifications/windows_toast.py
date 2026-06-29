@@ -121,7 +121,7 @@ def notify_job_match(
     company: str,
     score: float,
     url: str,
-    open_url_fallback: bool = True,
+    open_url_fallback: bool = False,
 ) -> NotificationDeliveryResult:
     """Send a Windows toast notification when dependencies are available."""
     notifier, supports_click_callback, backend = _load_toast_backend()

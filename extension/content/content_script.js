@@ -15,11 +15,22 @@ function safeSendMessage(message, callback) {
   try {
     if (chrome.runtime?.id) {
       if (callback) {
-        chrome.runtime.sendMessage(message, callback);
+        chrome.runtime.sendMessage(message, (response) => {
+          if (chrome.runtime.lastError) {
+            // Receiving end doesn't exist - this is normal when background script is busy
+            console.warn('JobPipe: No receiver for message:', message.action, '(' + chrome.runtime.lastError.message + ')');
+            callback(undefined);
+          } else {
+            callback(response);
+          }
+        });
       } else {
         return chrome.runtime.sendMessage(message).catch((error) => {
-          if (error.message?.includes('Extension context invalidated')) {
-            console.warn('JobPipe: Extension context invalidated:', error.message);
+          if (error.message?.includes('Extension context invalidated') ||
+              error.message?.includes('Could not establish connection') ||
+              error.message?.includes('Receiving end does not exist')) {
+            // These are normal when background script isn't ready
+            console.warn('JobPipe: Message not delivered (receiver not ready):', message.action);
           } else {
             console.error('JobPipe: Error sending message:', error);
           }
@@ -1711,6 +1722,10 @@ function extractHiringCafeJobsFromDom() {
         if (seen.has(url)) return;
         seen.add(url);
 
+        // Extract job ID from URL for deduplication
+        const jobIdMatch = url.match(/\/viewjob\/([^/?]+)/);
+        const jobId = jobIdMatch ? jobIdMatch[1] : null;
+
         // Find the card container using closest() - matches relative z-index wrapper
         const card = link.closest('[class*="z-"][class*="relative"]') ||
                      link.closest('[class*="rounded-xl"]') ||
@@ -1732,12 +1747,40 @@ function extractHiringCafeJobsFromDom() {
           ? cardText.substring(0, 500).trim() 
           : `${title} at ${company}`;
 
+        // Extract additional metadata from card
+        const cardFullText = card.textContent || '';
+        
+        // Location: look for city, state pattern
+        let location = null;
+        const locationMatch = cardFullText.match(/([A-Z][a-z]+(?:\s[A-Z][a-z]+)*,\s[A-Z]{2}(?:\s[A-Z][a-z]+)?)/);
+        if (locationMatch) location = locationMatch[1];
+
+        // Workplace type: Onsite/Hybrid/Remote
+        let workplaceType = null;
+        const workplaceMatch = cardFullText.match(/\b(Onsite|Remote|Hybrid)\b/i);
+        if (workplaceMatch) workplaceType = workplaceMatch[1];
+
+        // Posted time: "2d ago", "1w ago", etc.
+        let postedAgo = null;
+        const postedMatch = cardFullText.match(/(\d+\s*[dwmyh]\w*\s*ago)/i);
+        if (postedMatch) postedAgo = postedMatch[1];
+
+        // Compensation: look for salary patterns
+        let compensation = null;
+        const compMatch = cardFullText.match(/\$[\d,]+k?\s*-\s*\$?[\d,]+k?\s*\/\s*(?:yr|mo|hr|wk|day)/i);
+        if (compMatch) compensation = compMatch[0];
+
         jobs.push({
           platform: 'HiringCafe',
+          id: jobId ? `hiringcafe-${jobId}` : null,
           title: title.substring(0, 200),
           company: company,
           url: url,
           description: description,
+          location: location,
+          workplace_type: workplaceType,
+          posted_ago: postedAgo,
+          compensation: compensation,
         });
       } catch (e) { /* skip failed items */ }
     });
@@ -1995,14 +2038,16 @@ async function extractBatchJobs() {
 
     console.log('JobPipe: Extracting jobs from HiringCafe...');
 
-    // Try __NEXT_DATA__ first for rich data (full descriptions, compensation, etc.)
-    // This is the most reliable method on the initial search results page
-    let extractedJobs = extractJobsFromNextData();
+    // For search results pages, prefer DOM extraction because __NEXT_DATA__ 
+    // becomes stale after SPA navigation (pagination, filters, etc.).
+    // __NEXT_DATA__ only reflects the initial server-side render.
+    // DOM extraction always reflects the current visible page state.
+    let extractedJobs = extractHiringCafeJobsFromDom();
     
     if (extractedJobs.length === 0) {
-      // Fallback: DOM-only extraction for SPA-navigated pages
-      console.log('JobPipe: No __NEXT_DATA__ hits, falling back to DOM extraction...');
-      extractedJobs = extractHiringCafeJobsFromDom();
+      // Fallback: Try __NEXT_DATA__ for initial page load or if DOM extraction fails
+      console.log('JobPipe: DOM extraction found no jobs, trying __NEXT_DATA__...');
+      extractedJobs = extractJobsFromNextData();
     }
 
     console.log(`JobPipe: Found ${extractedJobs.length} jobs`);
@@ -2143,6 +2188,9 @@ let overlayVisible = true;
 let lastJobCount = 0; // Track number of jobs last scraped
 let detailPageEnrichmentTimer = null; // Debounce timer for detail page enrichment
 let lastJobSignature = null; // Track last job data signature for change detection
+let lastScrapedJobUrls = new Set(); // Track job URLs from last successful scrape
+let domMutationObserver = null; // Observer for DOM changes
+let domSettledTimer = null; // Timer to wait for DOM to settle after mutations
 
 // Check if auto-scrape is enabled on page load
 chrome.storage.local.get(['autoScrapeEnabled'], (result) => {
@@ -2158,6 +2206,86 @@ chrome.storage.local.get(['autoScrapeEnabled'], (result) => {
   }
 });
 
+/**
+ * Wait for DOM to settle after mutations (e.g., after SPA navigation).
+ * Uses MutationObserver to detect when DOM changes have stopped for a period.
+ * This ensures we scrape AFTER Next.js has finished rendering the new page.
+ * @param {Function} callback - Function to call when DOM has settled
+ * @param {number} settleTime - Time in ms to wait for no mutations (default: 800ms)
+ * @param {number} maxWait - Maximum time to wait in ms (default: 5000ms)
+ */
+function waitForDomToSettle(callback, settleTime = 800, maxWait = 5000) {
+  // Clear any existing observer/timer
+  if (domMutationObserver) {
+    domMutationObserver.disconnect();
+    domMutationObserver = null;
+  }
+  if (domSettledTimer) {
+    clearTimeout(domSettledTimer);
+    domSettledTimer = null;
+  }
+  
+  const startTime = Date.now();
+  let lastMutationTime = Date.now();
+  
+  // Create observer to watch for DOM changes
+  domMutationObserver = new MutationObserver((mutations) => {
+    // Check if mutations are relevant (job cards or main content changed)
+    const hasRelevantMutations = mutations.some(m => {
+      const target = m.target;
+      const targetText = target.className || target.id || '';
+      return targetText.includes('job') || 
+             targetText.includes('card') || 
+             targetText.includes('list') ||
+             target.tagName === 'MAIN' ||
+             target.tagName === 'ARTICLE' ||
+             m.addedNodes.length > 0;
+    });
+    
+    if (hasRelevantMutations) {
+      lastMutationTime = Date.now();
+      console.log('JobPipe: Relevant DOM mutation detected');
+    }
+  });
+  
+  // Start observing
+  domMutationObserver.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: false,
+  });
+  
+  // Check periodically if DOM has settled
+  const checkSettled = () => {
+    const timeSinceLastMutation = Date.now() - lastMutationTime;
+    const totalTime = Date.now() - startTime;
+    
+    if (timeSinceLastMutation >= settleTime) {
+      // DOM has settled
+      console.log(`JobPipe: DOM settled after ${totalTime}ms (no mutations for ${timeSinceLastMutation}ms)`);
+      if (domMutationObserver) {
+        domMutationObserver.disconnect();
+        domMutationObserver = null;
+      }
+      callback();
+    } else if (totalTime >= maxWait) {
+      // Timeout - proceed anyway
+      console.log(`JobPipe: DOM settle timeout after ${totalTime}ms, proceeding with scrape`);
+      if (domMutationObserver) {
+        domMutationObserver.disconnect();
+        domMutationObserver = null;
+      }
+      callback();
+    } else {
+      // Check again in 200ms
+      domSettledTimer = setTimeout(checkSettled, 200);
+    }
+  };
+  
+  // Start checking after initial settleTime
+  domSettledTimer = setTimeout(checkSettled, settleTime);
+}
+
 // Detect SPA navigation and poll for new job data
 
 // Detect URL changes (SPA navigation)
@@ -2168,8 +2296,13 @@ setInterval(() => {
     lastUrl = currentUrl;
     autoScrapeAttempted = false;
     lastJobCount = 0;
+    
+    // Wait for DOM to settle before scraping (Next.js needs time to render new page)
     if (autoScrapeEnabled) {
-      setTimeout(() => attemptAutoScrape(), 500);
+      waitForDomToSettle(() => {
+        console.log('JobPipe: DOM settled after URL change, attempting scrape');
+        attemptAutoScrape();
+      });
     }
   }
 }, 500);
@@ -2179,8 +2312,13 @@ window.addEventListener('popstate', () => {
   console.log('JobPipe: Popstate detected');
   autoScrapeAttempted = false;
   lastJobCount = 0;
+  
+  // Wait for DOM to settle before scraping
   if (autoScrapeEnabled) {
-    setTimeout(() => attemptAutoScrape(), 500);
+    waitForDomToSettle(() => {
+      console.log('JobPipe: DOM settled after popstate, attempting scrape');
+      attemptAutoScrape();
+    });
   }
 });
 
@@ -2192,8 +2330,13 @@ history.pushState = function() {
   console.log('JobPipe: Pushstate detected');
   autoScrapeAttempted = false;
   lastJobCount = 0;
+  
+  // Wait for DOM to settle before scraping
   if (autoScrapeEnabled) {
-    setTimeout(() => attemptAutoScrape(), 500);
+    waitForDomToSettle(() => {
+      console.log('JobPipe: DOM settled after pushstate, attempting scrape');
+      attemptAutoScrape();
+    });
   }
 };
 history.replaceState = function() {
@@ -2201,8 +2344,13 @@ history.replaceState = function() {
   console.log('JobPipe: Replacestate detected');
   autoScrapeAttempted = false;
   lastJobCount = 0;
+  
+  // Wait for DOM to settle before scraping
   if (autoScrapeEnabled) {
-    setTimeout(() => attemptAutoScrape(), 500);
+    waitForDomToSettle(() => {
+      console.log('JobPipe: DOM settled after replacestate, attempting scrape');
+      attemptAutoScrape();
+    });
   }
 };
 
@@ -2478,7 +2626,8 @@ async function attemptAutoScrape() {
   });
 
   try {
-    // Poll for jobs to appear (SPA navigation may take time to load data)
+    // Poll for NEW jobs to appear (SPA navigation may take time to load data)
+    // We need to wait for the DOM to show DIFFERENT jobs than the previous page
     updateOverlayStatus('Waiting for page...', 0, 0, 'Detecting job...');
     let jobs = [];
     const maxWait = 10000;
@@ -2486,10 +2635,20 @@ async function attemptAutoScrape() {
     
     while (Date.now() - startTime < maxWait) {
       jobs = await extractBatchJobs();
+      
       if (jobs && jobs.length > 0) {
-        console.log(`JobPipe: Found ${jobs.length} jobs after ${Date.now() - startTime}ms`);
-        break;
+        // Check if these are NEW jobs (different from last scraped page)
+        const currentJobUrls = new Set(jobs.map(j => j.url));
+        const hasNewJobs = Array.from(currentJobUrls).some(url => !lastScrapedJobUrls.has(url));
+        
+        if (hasNewJobs || lastScrapedJobUrls.size === 0) {
+          console.log(`JobPipe: Found ${jobs.length} NEW jobs after ${Date.now() - startTime}ms`);
+          break;
+        } else {
+          console.log(`JobPipe: Found ${jobs.length} jobs but they're from previous page, waiting...`);
+        }
       }
+      
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
@@ -2572,6 +2731,10 @@ async function attemptAutoScrape() {
       });
       // Track this URL to prevent double-sends
       locallySentUrls.add(currentUrl);
+      
+      // Update lastScrapedJobUrls with current page's jobs for next navigation
+      lastScrapedJobUrls = new Set(jobs.map(j => j.url));
+      console.log(`JobPipe: Updated lastScrapedJobUrls with ${lastScrapedJobUrls.size} job URLs from current page`);
       
       // Show an in-page success toast for visible confirmation
       showInPageToast(`✓ ${sentCount} job${sentCount !== 1 ? 's' : ''} sent to JobPipe${isDetailPage ? ' (enriched)' : ''}!`, 'success');

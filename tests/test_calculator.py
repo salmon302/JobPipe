@@ -74,13 +74,15 @@ def test_compute_blended_relevance_custom_weights() -> None:
 
 
 def test_compute_confidence_high() -> None:
-    conf = compute_confidence("skills: 0.800", "Years: 0.90", cv_parsed=True)
-    assert conf == "high"
+    conf_level, conf_reason = compute_confidence("skills: 0.800", "Years: 0.90", cv_parsed=True)
+    assert conf_level == "high"
+    assert "keyword" in conf_reason.lower() or "fully parsed" in conf_reason.lower()
 
 
 def test_compute_confidence_low() -> None:
-    conf = compute_confidence("No CV sections", "No skills", cv_parsed=False)
-    assert conf == "low"
+    conf_level, conf_reason = compute_confidence("No CV sections", "No skills", cv_parsed=False)
+    assert conf_level == "low"
+    assert "not parsed" in conf_reason.lower()
 
 
 def test_score_weights_normalize() -> None:

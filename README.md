@@ -25,13 +25,27 @@ Local job intake, scoring, and resume pipeline driven by a browser extension ing
    - Optional for MCP resume server: `pip install -e .[resume]`
    - Optional for desktop GUI: `pip install -e .[gui]`
 2. Copy `.env.example` to `.env` and adjust values.
-3. Initialize the database:
+3. **Download embedding model for offline use** (run once while online):
+   - `python scripts/download_embedding_model.py`
+   - This caches the model locally (~80MB) for offline scoring
+4. Initialize the database:
    - `jobpipe init-db`
-4. Start the ingest server:
+5. Start the ingest server:
    - `jobpipe ingest-server`
    - The server listens on `http://127.0.0.1:3838` by default (see `.env`).
-5. Launch the desktop GUI (auto-starts ingest server):
+6. Launch the desktop GUI (auto-starts ingest server):
    - `jobpipe gui`
+
+### Offline Scoring
+
+After running `python scripts/download_embedding_model.py`, JobPipe can score jobs offline without internet access. The embedding model is cached at `~/.cache/huggingface/hub`.
+
+To verify offline mode works:
+```bash
+# Test offline embedding
+$env:HF_HUB_OFFLINE=1
+.venv\Scripts\python.exe -c "from jobpipe.scoring.embeddings import LocalEmbedder; e = LocalEmbedder('sentence-transformers/all-MiniLM-L6-v2'); print('Offline OK')"
+```
 
 ### Extension payload
 

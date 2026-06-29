@@ -18,9 +18,10 @@
       }
     },
     {
-      "name": "JobPipe: GUI",
+      "name": "JobPipe: GUI (venv)",
       "type": "debugpy",
       "request": "launch",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "module": "jobpipe",
       "args": ["gui"],
       "cwd": "${workspaceFolder}",
@@ -29,8 +30,7 @@
       "raise": "False",
       "envFile": "${workspaceFolder}/.env",
       "env": {
-        "PYTHONPATH": "${workspaceFolder}/src",
-        "PYTHONEXECUTABLE": "py -3.14"
+        "PYTHONPATH": "${workspaceFolder}/src"
       }
     },
     {

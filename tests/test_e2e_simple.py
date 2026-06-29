@@ -143,7 +143,8 @@ Python, FastAPI, AWS, PostgreSQL
             self.assertEqual(response.status_code, 200)
 
             # Check database
-            repo = JobRepository(self.db_path)
+            settings = self._create_settings(port)
+            repo = JobRepository(self.db_path, settings)
             jobs = repo.list_top_jobs(limit=10)
 
             self.assertEqual(len(jobs), 1)

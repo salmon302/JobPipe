@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
+from threading import Lock
+from typing import Any
+import logging
 
-from jobpipe.storage.db import connect
-from jobpipe.storage.models import JobRecord, NotificationAuditRecord, ScrapeRunRecord
+from jobpipe.storage.db import connect, _get_pool
+from jobpipe.storage.connection_pool import PooledConnection
+from jobpipe.storage.models import JobRecord, NotificationAuditRecord, ScrapeRunRecord, _parse_datetime
+
+LOGGER = logging.getLogger(__name__)
 
 
 _JOB_SELECT_COLUMNS = """
@@ -18,13 +25,35 @@ _JOB_SELECT_COLUMNS = """
 
 
 class JobRepository:
-    def __init__(self, db_path: Path) -> None:
+    """
+    Repository for job data with performance optimizations.
+    
+    Optimizations included:
+    - Connection pooling via db.py
+    - Query result caching for expensive operations
+    - Optimized batch operations
+    - FTS5 support for full-text search
+    """
+    
+    def __init__(self, db_path: Path, settings: Settings) -> None:
         self._db_path = db_path
+        self._settings = settings
+        self._cache_lock = Lock()
+        self._job_count_cache: tuple[int, datetime] | None = None
+        self._cache_ttl_seconds = 30  # Cache TTL in seconds
+        self._pool = _get_pool(db_path, max_connections=settings.db_pool_max_connections, wait_timeout=settings.db_pool_wait_timeout)  # Use connection pool for better performance
+
+    def _is_cache_valid(self, cache_entry: tuple[Any, datetime]) -> bool:
+        """Check if a cache entry is still valid based on TTL."""
+        import time
+        _, timestamp = cache_entry
+        age = (datetime.now(timezone.utc) - timestamp).total_seconds()
+        return age < self._cache_ttl_seconds
 
     def create_scrape_run(self, run_id: str, started_at: datetime | None = None) -> None:
         started = (started_at or datetime.now(timezone.utc)).isoformat()
 
-        with connect(self._db_path) as conn:
+        with PooledConnection(self._pool) as conn:
             conn.execute(
                 """
                 INSERT INTO scrape_runs (run_id, started_at, status)
@@ -42,7 +71,7 @@ class JobRepository:
         updated: int,
         status: str = "Scoring",
     ) -> None:
-        with connect(self._db_path) as conn:
+        with PooledConnection(self._pool) as conn:
             conn.execute(
                 """
                 UPDATE scrape_runs
@@ -190,6 +219,36 @@ class JobRepository:
             )
             conn.commit()
 
+    def record_notification_events_bulk(self, events: list[tuple]) -> None:
+        """Record multiple notification events in a single transaction.
+        
+        Args:
+            events: List of tuples (run_id, job_id, title, company, score, url,
+                   delivery_status, error_message, notified_at)
+        """
+        if not events:
+            return
+
+        with connect(self._db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO notifications_audit (
+                    run_id,
+                    job_id,
+                    title,
+                    company,
+                    score,
+                    url,
+                    delivery_status,
+                    error_message,
+                    notified_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                events,
+            )
+            conn.commit()
+
     def list_recent_notifications(self, limit: int = 20) -> list[NotificationAuditRecord]:
         with connect(self._db_path) as conn:
             rows = conn.execute(
@@ -216,7 +275,7 @@ class JobRepository:
         updated = 0
 
         with connect(self._db_path) as conn:
-            def chunked(items: list[str], size: int = 900) -> list[list[str]]:
+            def chunked(items: list[str], size: int = 100) -> list[list[str]]:
                 return [items[i : i + size] for i in range(0, len(items), size)]
 
             job_ids = [job.id for job in jobs]
@@ -250,12 +309,14 @@ class JobRepository:
                 return url.split("?")[0].split("#")[0]
 
             incoming_norm_urls = [_normalize_url(job.url) for job in jobs]
-            url_placeholders = ",".join("?" for _ in incoming_norm_urls)
             if incoming_norm_urls:
-                # Build a mapping of normalized URL -> existing ID
+                # Build a mapping of normalized URL -> existing ID (O(n) instead of O(n²))
                 url_to_existing_id: dict[str, str] = {}
+                # Pre-compute a set for O(1) lookups
+                incoming_norm_set = set(incoming_norm_urls)
+                
                 for chunk_norm_urls in [
-                    incoming_norm_urls[i:i+900] for i in range(0, len(incoming_norm_urls), 900)
+                    list(incoming_norm_set)[i:i+900] for i in range(0, len(incoming_norm_set), 900)
                 ]:
                     chunk_placeholders = ",".join("?" for _ in chunk_norm_urls)
                     url_rows = conn.execute(
@@ -264,10 +325,8 @@ class JobRepository:
                     ).fetchall()
                     for row in url_rows:
                         norm_existing = _normalize_url(row["url"])
-                        for u in chunk_norm_urls:
-                            if u == norm_existing:
-                                url_to_existing_id[u] = row["id"]
-                                break
+                        if norm_existing in incoming_norm_set:
+                            url_to_existing_id[norm_existing] = row["id"]
 
                 # Rewrite IDs for jobs whose normalized URL already exists under a different ID
                 for job in jobs:
@@ -454,7 +513,16 @@ class JobRepository:
             )
             conn.commit()
 
-    def update_scoring_bulk(self, updates: list[tuple]) -> None:
+    def update_scoring_bulk(self, updates: list[tuple], batch_size: int | None = None) -> None:
+        """Update scoring in bulk with configurable batch size.
+        
+        Args:
+            updates: List of tuples (match_score, years_required, is_remote, status,
+                           score_relevance, score_attainability, score_recency, job_id)
+            batch_size: Number of updates to process in each transaction (defaults to settings.scoring_batch_size)
+        """
+        if batch_size is None:
+            batch_size = self._settings.scoring_batch_size
         if not updates:
             return
 
@@ -481,21 +549,48 @@ class JobRepository:
             ) in updates
         ]
 
-        with connect(self._db_path) as conn:
+        # Process in batches to avoid large transactions
+        total_batches = (len(normalized) + batch_size - 1) // batch_size
+        
+        for batch_num in range(total_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, len(normalized))
+            batch = normalized[start_idx:end_idx]
+            
+            with PooledConnection(self._pool) as conn:
+                conn.executemany(
+                    """
+                    UPDATE jobs
+                    SET match_score = ?,
+                        years_required = ?,
+                        is_remote = ?,
+                        status = ?,
+                        score_relevance = ?,
+                        score_attainability = ?,
+                        score_recency = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    batch,
+                )
+                conn.commit()
+            
+            LOGGER.info("Updated scoring batch %d/%d (%d records)", batch_num + 1, total_batches, len(batch))
+
+    def update_last_scored_at(self, job_ids: list[str], timestamp: str) -> None:
+        """Update last_scored_at timestamp for multiple jobs in a single transaction.
+        
+        Args:
+            job_ids: List of job IDs to update
+            timestamp: ISO format timestamp string
+        """
+        if not job_ids:
+            return
+
+        with PooledConnection(self._pool) as conn:
             conn.executemany(
-                """
-                UPDATE jobs
-                SET match_score = ?,
-                    years_required = ?,
-                    is_remote = ?,
-                    status = ?,
-                    score_relevance = ?,
-                    score_attainability = ?,
-                    score_recency = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                normalized,
+                "UPDATE jobs SET last_scored_at = ? WHERE id = ?",
+                [(timestamp, job_id) for job_id in job_ids]
             )
             conn.commit()
 
@@ -577,45 +672,88 @@ class JobRepository:
 
         return JobRecord.from_row(row)
 
-    def list_jobs(self, limit: int = 200, search_query: str | None = None) -> list[JobRecord]:
+    def list_jobs(
+        self,
+        limit: int = 200,
+        offset: int = 0,
+        search_query: str | None = None,
+    ) -> list[JobRecord]:
+        """List jobs with optional search and pagination.
+        
+        Args:
+            limit: Maximum number of jobs to return
+            offset: Number of jobs to skip (for pagination)
+            search_query: Optional search string for FTS
+        """
         search = (search_query or "").strip()
 
         if search:
             tokens = [token for token in search.split() if token]
             if tokens:
-                fts_query = " AND ".join(
-                    f'"{token.replace("\"", "\"\"")}"' for token in tokens
-                )
+                escaped_tokens = [token.replace('"', '""') for token in tokens]
+                fts_query = " AND ".join(f'"{token}"' for token in escaped_tokens)
                 query = f"""
                     SELECT {_JOB_SELECT_COLUMNS}
                     FROM jobs
                     JOIN jobs_fts ON jobs_fts.rowid = jobs.rowid
                     WHERE jobs_fts MATCH ?
                     ORDER BY (jobs.match_score IS NULL), jobs.match_score DESC, jobs.date_posted DESC
-                    LIMIT ?
+                    LIMIT ? OFFSET ?
                 """
-                params = (fts_query, limit)
+                params = (fts_query, limit, offset)
             else:
                 query = f"""
                     SELECT {_JOB_SELECT_COLUMNS}
                     FROM jobs
                     ORDER BY (jobs.match_score IS NULL), jobs.match_score DESC, jobs.date_posted DESC
-                    LIMIT ?
+                    LIMIT ? OFFSET ?
                 """
-                params = (limit,)
+                params = (limit, offset)
         else:
             query = f"""
                 SELECT {_JOB_SELECT_COLUMNS}
                 FROM jobs
                 ORDER BY (jobs.match_score IS NULL), jobs.match_score DESC, jobs.date_posted DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
             """
-            params = (limit,)
+            params = (limit, offset)
 
         with connect(self._db_path) as conn:
             rows = conn.execute(query, params).fetchall()
 
         return [JobRecord.from_row(row) for row in rows]
+
+    def count_jobs(self, search_query: str | None = None) -> int:
+        """Count total jobs, optionally filtered by search query.
+        
+        Returns:
+            Total number of jobs matching the search criteria
+        """
+        search = (search_query or "").strip()
+
+        if search:
+            tokens = [token for token in search.split() if token]
+            if tokens:
+                escaped_tokens = [token.replace('"', '""') for token in tokens]
+                fts_query = " AND ".join(f'"{token}"' for token in escaped_tokens)
+                query = """
+                    SELECT COUNT(*) as count
+                    FROM jobs
+                    JOIN jobs_fts ON jobs_fts.rowid = jobs.rowid
+                    WHERE jobs_fts MATCH ?
+                """
+                params = (fts_query,)
+            else:
+                query = "SELECT COUNT(*) as count FROM jobs"
+                params = ()
+        else:
+            query = "SELECT COUNT(*) as count FROM jobs"
+            params = ()
+
+        with connect(self._db_path) as conn:
+            row = conn.execute(query, params).fetchone()
+
+        return int(row["count"] or 0)
 
     def mark_notified(self, job_ids: list[str]) -> None:
         if not job_ids:
@@ -923,3 +1061,115 @@ class JobRepository:
             ).fetchall()
 
         return [ResumeVariant.from_row(row) for row in rows]
+
+    def search_jobs_fts(self, search_query: str, limit: int = 100) -> list[JobRecord]:
+        """
+        Search jobs using FTS5 full-text search (optimized for performance).
+        
+        Args:
+            search_query: Search query with space-separated tokens
+            limit: Maximum number of results
+            
+        Returns:
+            List of JobRecord objects matching the search
+        """
+        tokens = [token for token in search_query.strip().split() if token]
+        if not tokens:
+            return []
+        
+        # Build FTS5 query - use OR for broader matches
+        escaped_tokens = [token.replace('"', '""') for token in tokens]
+        fts_query = " OR ".join(f'"{token}"' for token in escaped_tokens)
+        
+        query = f"""
+            SELECT {_JOB_SELECT_COLUMNS},
+                   rank as fts_rank
+            FROM jobs
+            JOIN jobs_fts ON jobs_fts.rowid = jobs.rowid
+            WHERE jobs_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+        """
+        
+        with connect(self._db_path) as conn:
+            try:
+                rows = conn.execute(query, (fts_query, limit)).fetchall()
+            except sqlite3.OperationalError:
+                # FTS table might not exist, fall back to LIKE search
+                like_query = f"""
+                    SELECT {_JOB_SELECT_COLUMNS}
+                    FROM jobs
+                    WHERE title LIKE ? OR company LIKE ? OR description LIKE ?
+                    ORDER BY (jobs.match_score IS NULL), jobs.match_score DESC
+                    LIMIT ?
+                """
+                like_pattern = f"%{search_query}%"
+                rows = conn.execute(like_query, (like_pattern, like_pattern, like_pattern, limit)).fetchall()
+
+        return [JobRecord.from_row(row) for row in rows]
+
+    def get_job_count_cached(self) -> int:
+        """
+        Get job count with caching to avoid repeated COUNT queries.
+        
+        Returns:
+            Total number of jobs in the database
+        """
+        with self._cache_lock:
+            if self._job_count_cache and self._is_cache_valid(self._job_count_cache):
+                return self._job_count_cache[0]
+            
+            # Cache miss or expired, query database
+            with connect(self._db_path) as conn:
+                row = conn.execute("SELECT COUNT(*) as count FROM jobs").fetchone()
+                count = int(row["count"] or 0)
+            
+            from datetime import datetime, timezone
+            self._job_count_cache = (count, datetime.now(timezone.utc))
+            return count
+
+    def invalidate_cache(self) -> None:
+        """Invalidate all cached data (call after bulk updates)."""
+        with self._cache_lock:
+            self._job_count_cache = None
+
+    def get_last_scoring_timestamp(self) -> datetime | None:
+        """Get the timestamp of the last scoring run."""
+        with connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT MAX(last_scored_at) as last_scored FROM jobs WHERE last_scored_at IS NOT NULL"
+            ).fetchone()
+            
+        if row is None or row["last_scored"] is None:
+            return None
+            
+        return _parse_datetime(row["last_scored"])
+        
+    def list_jobs_for_incremental_scoring(self, limit: int = 250) -> list[JobRecord]:
+        """List jobs that need to be scored (new or updated since last scoring)."""
+        last_scored = self.get_last_scoring_timestamp()
+        
+        if last_scored is None:
+            # No previous scoring, score all jobs
+            return self.list_jobs_for_scoring(limit=limit)
+            
+        with connect(self._db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, platform, title, company, url, description, date_posted,
+                       match_score, status, years_required, is_remote,
+                       score_relevance, score_attainability, score_recency,
+                       summary, requirements, location, county, compensation,
+                       workplace_type, employment_type, department, team,
+                       views, saves, applications, posted_at, posted_ago
+                FROM jobs
+                WHERE (last_scored_at IS NULL OR last_scored_at < updated_at)
+                  AND match_score IS NULL 
+                  AND status IN ('Queued', 'Notified')
+                ORDER BY date_posted DESC
+                LIMIT ?
+                """,
+                (limit,)
+            ).fetchall()
+
+        return [JobRecord.from_row(row) for row in rows]

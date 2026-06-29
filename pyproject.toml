@@ -20,6 +20,7 @@ dependencies = [
   "sentence-transformers>=3.0.1",
   "numpy>=1.26.4",
   "python-dateutil>=2.9.0.post0",
+  "requests>=2.31.0",
   "win10toast-click>=0.1; platform_system == 'Windows'"
 ]
 

@@ -15,11 +15,22 @@ function safeSendMessage(message, callback) {
   try {
     if (chrome.runtime?.id) {
       if (callback) {
-        chrome.runtime.sendMessage(message, callback);
+        chrome.runtime.sendMessage(message, (response) => {
+          if (chrome.runtime.lastError) {
+            // Receiving end doesn't exist - this is normal when background script is busy
+            console.warn('JobPipe: No receiver for message:', message.action, '(' + chrome.runtime.lastError.message + ')');
+            callback(undefined);
+          } else {
+            callback(response);
+          }
+        });
       } else {
         return chrome.runtime.sendMessage(message).catch((error) => {
-          if (error.message?.includes('Extension context invalidated')) {
-            console.warn('JobPipe: Extension context invalidated:', error.message);
+          if (error.message?.includes('Extension context invalidated') ||
+              error.message?.includes('Could not establish connection') ||
+              error.message?.includes('Receiving end does not exist')) {
+            // These are normal when popup is closed or background script isn't ready
+            console.warn('JobPipe: Message not delivered (receiver not ready):', message.action);
           } else {
             console.error('JobPipe: Error sending message:', error);
           }

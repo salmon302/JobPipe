@@ -148,7 +148,31 @@ _MIGRATIONS: list[tuple[int, str]] = [
         7,
         """
         CREATE INDEX IF NOT EXISTS idx_jobs_score_posted ON jobs(match_score DESC, date_posted DESC);
-
+        """,
+    ),
+    (
+        8,
+        """
+        CREATE INDEX IF NOT EXISTS idx_jobs_url ON jobs(url);
+        """,
+    ),
+    (
+        9,
+        """
+        CREATE INDEX IF NOT EXISTS idx_jobs_normalized_url ON jobs(url);
+        """,
+    ),
+    (
+        10,
+        """
+        -- Optimize URL deduplication with covering index
+        CREATE INDEX IF NOT EXISTS idx_jobs_url_covering ON jobs(url, id);
+        """,
+    ),
+    (
+        11,
+        """
+        -- Create FTS virtual table for full-text search
         CREATE VIRTUAL TABLE IF NOT EXISTS jobs_fts USING fts5(
             title,
             company,
@@ -169,6 +193,7 @@ _MIGRATIONS: list[tuple[int, str]] = [
             content_rowid='rowid'
         );
 
+        -- Trigger to index new jobs
         CREATE TRIGGER IF NOT EXISTS jobs_ai AFTER INSERT ON jobs BEGIN
             INSERT INTO jobs_fts(
                 rowid,
@@ -207,10 +232,12 @@ _MIGRATIONS: list[tuple[int, str]] = [
             );
         END;
 
+        -- Trigger to remove deleted jobs from FTS
         CREATE TRIGGER IF NOT EXISTS jobs_ad AFTER DELETE ON jobs BEGIN
             INSERT INTO jobs_fts(jobs_fts, rowid) VALUES('delete', old.rowid);
         END;
 
+        -- Trigger to update FTS on job update
         CREATE TRIGGER IF NOT EXISTS jobs_au AFTER UPDATE ON jobs BEGIN
             INSERT INTO jobs_fts(jobs_fts, rowid) VALUES('delete', old.rowid);
             INSERT INTO jobs_fts(
@@ -250,7 +277,27 @@ _MIGRATIONS: list[tuple[int, str]] = [
             );
         END;
 
+        -- Rebuild FTS index with existing data
         INSERT INTO jobs_fts(jobs_fts) VALUES('rebuild');
+        """,
+    ),
+    (
+        12,
+        """
+        -- Add indexes for scoring performance
+        CREATE INDEX IF NOT EXISTS idx_jobs_for_scoring ON jobs(match_score, status, date_posted DESC) WHERE match_score IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_jobs_score_status ON jobs(match_score DESC, status, date_posted DESC);
+        CREATE INDEX IF NOT EXISTS idx_jobs_status_posted ON jobs(status, date_posted DESC);
+        CREATE INDEX IF NOT EXISTS idx_jobs_status_score ON jobs(status, match_score DESC);
+        CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+        """,
+    ),
+    (
+        13,
+        """
+        -- Add last_scored_at column for incremental scoring
+        ALTER TABLE jobs ADD COLUMN last_scored_at TEXT;
+        CREATE INDEX IF NOT EXISTS idx_jobs_last_scored ON jobs(last_scored_at DESC);
         """,
     ),
 ]
@@ -274,9 +321,14 @@ def _add_columns_if_missing(
 
 
 def latest_schema_version() -> int:
+    """Return the latest schema version from migrations list."""
     if not _MIGRATIONS:
         return 0
     return _MIGRATIONS[-1][0]
+
+
+# Current schema version - must match the last migration number
+CURRENT_SCHEMA_VERSION = 13
 
 
 def get_schema_version(conn: sqlite3.Connection) -> int:

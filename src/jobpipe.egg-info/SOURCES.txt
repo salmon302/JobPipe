@@ -57,6 +57,7 @@ tests/test_gemini_client.py
 tests/test_gui_services.py
 tests/test_keyword_scorer.py
 tests/test_latex_editor.py
+tests/test_mcp_server.py
 tests/test_pipeline_run_once.py
 tests/test_prefilter.py
 tests/test_recency.py

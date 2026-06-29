@@ -95,16 +95,26 @@ class IngestRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not-found"})
             return
 
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "status": "ok",
-                "db_path": str(self.server.service.settings.db_path),
-                "job_description_path": str(
-                    self.server.service.settings.job_description_path
-                ),
-            },
-        )
+        # Get connection pool status
+        pool_status = None
+        try:
+            from jobpipe.storage.db import get_pool_status
+            pool_status = get_pool_status(self.server.service.settings.db_path)
+        except Exception:
+            pass
+
+        response = {
+            "status": "ok",
+            "db_path": str(self.server.service.settings.db_path),
+            "job_description_path": str(
+                self.server.service.settings.job_description_path
+            ),
+        }
+        
+        if pool_status:
+            response["connection_pool"] = pool_status
+
+        self._send_json(HTTPStatus.OK, response)
 
     def do_POST(self) -> None:  # noqa: N802
         if self._path() != "/ingest":
@@ -113,10 +123,22 @@ class IngestRequestHandler(BaseHTTPRequestHandler):
 
         try:
             payload = self._read_json_body()
-            LOGGER.info("IngestServer | Received ingest request with %d top-level keys", len(payload))
-            if "jobs" in payload:
-                LOGGER.info("IngestServer | Batch has %d jobs", len(payload["jobs"]))
+            job_count = len(payload.get('jobs', [payload])) if isinstance(payload, dict) else 1
+            LOGGER.info("IngestServer | Received ingest request with %d job(s)", job_count)
+            
+            # Log connection pool status if available
+            try:
+                from jobpipe.storage.db import get_pool_status
+                status = get_pool_status(self.server.service.settings.db_path)
+                if status:
+                    LOGGER.info("IngestServer | Connection pool status: created=%d, available=%d, max=%d, in_use=%d", 
+                                status['created'], status['available'], status['max'], status['in_use'])
+            except Exception:
+                pass
+            
+            LOGGER.info("IngestServer | Calling ingest_payload")
             result = self.server.service.ingest_payload(payload)
+            LOGGER.info("IngestServer | ingest_payload returned for run %s", result.run_id)
         except IngestPayloadError as exc:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -136,14 +158,19 @@ class IngestRequestHandler(BaseHTTPRequestHandler):
             )
             return
         except Exception as exc:  # pragma: no cover - defensive error handling
-            LOGGER.exception("Ingest handler failed")
+            LOGGER.exception("Ingest handler failed: %s", exc)
+            import traceback
+            error_detail = traceback.format_exc()
+            LOGGER.error("IngestServer | Full traceback:\n%s", error_detail)
             self._send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
-                {"error": "server-error", "message": str(exc)},
+                {"error": "server-error", "message": str(exc), "type": type(exc).__name__},
             )
             return
 
+        LOGGER.info("IngestServer | Sending response for run %s", result.run_id)
         self._send_json(HTTPStatus.OK, _result_payload(result))
+        LOGGER.info("IngestServer | Response sent for run %s", result.run_id)
 
     def do_GET(self) -> None:  # noqa: N802
         path = self._path()

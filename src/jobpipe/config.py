@@ -91,9 +91,17 @@ class Settings:
     auto_stage_job_description: bool
     embed_model: str
     embed_batch_size: int
-    score_async: bool
-    run_lock_path: Path
-    run_lock_stale_seconds: int
+    score_async: bool = False
+    auto_scoring_enabled: bool = True  # Enable/disable automatic job scoring
+    embed_quantize: bool = False  # Use quantized model for faster inference
+    run_lock_path: Path = Path("data/runtime/aggregator.lock")
+    run_lock_stale_seconds: int = 3600  # Increased to 1 hour to prevent premature lock clearance during long runs
+    # Connection pool settings
+    db_pool_max_connections: int = 30  # Increased from 15 to prevent connection pool exhaustion
+    db_pool_wait_timeout: float = 30.0
+    # Batch operation settings
+    upsert_chunk_size: int = 900
+    scoring_batch_size: int = 500
     # Scoring weights (Phase 2)
     relevance_weight: float = 0.5
     attainability_weight: float = 0.3
@@ -147,12 +155,12 @@ class Settings:
             ),
             critical_skills=_split_csv(getenv("JOBPIPE_CRITICAL_SKILLS"), []),
             reject_terms=_split_csv(
-                getenv("JOBPIPE_REJECT_TERMS"), ["senior", "staff", "principal"]
+                getenv("JOBPIPE_REJECT_TERMS"), []
             ),
             user_years_experience=_as_int(getenv("JOBPIPE_USER_YEARS_EXPERIENCE"), 1),
             notification_threshold=_as_float(
                 getenv("JOBPIPE_NOTIFICATION_THRESHOLD"),
-                0.0,
+                0.5,  # Only notify for jobs scoring 50% or higher
             ),
             auto_stage_job_description=_as_bool(
                 getenv("JOBPIPE_AUTO_STAGE_JOB_DESCRIPTION"),
@@ -163,6 +171,7 @@ class Settings:
                 "sentence-transformers/all-MiniLM-L6-v2",
             ),
             embed_batch_size=_as_int(getenv("JOBPIPE_EMBED_BATCH_SIZE"), 32),
+            embed_quantize=_as_bool(getenv("JOBPIPE_EMBED_QUANTIZE"), False),
             score_async=_as_bool(getenv("JOBPIPE_SCORE_ASYNC"), False),
             relevance_weight=_as_float(getenv("JOBPIPE_RELEVANCE_WEIGHT"), 0.5),
             attainability_weight=_as_float(getenv("JOBPIPE_ATTAINABILITY_WEIGHT"), 0.3),

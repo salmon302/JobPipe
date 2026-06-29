@@ -15,11 +15,22 @@ function safeSendMessage(message, callback) {
   try {
     if (chrome.runtime?.id) {
       if (callback) {
-        chrome.runtime.sendMessage(message, callback);
+        chrome.runtime.sendMessage(message, (response) => {
+          if (chrome.runtime.lastError) {
+            // Receiving end doesn't exist - this is normal when popup is closed
+            console.warn('JobPipe: No receiver for message:', message.action, '(' + chrome.runtime.lastError.message + ')');
+            callback(undefined);
+          } else {
+            callback(response);
+          }
+        });
       } else {
         return chrome.runtime.sendMessage(message).catch((error) => {
-          if (error.message?.includes('Extension context invalidated')) {
-            console.warn('JobPipe: Extension context invalidated:', error.message);
+          if (error.message?.includes('Extension context invalidated') ||
+              error.message?.includes('Could not establish connection') ||
+              error.message?.includes('Receiving end does not exist')) {
+            // These are normal when popup is closed or content script isn't ready
+            console.warn('JobPipe: Message not delivered (receiver not ready):', message.action);
           } else {
             console.error('JobPipe: Error sending message:', error);
           }
@@ -80,32 +91,50 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 function scrapeTabWithFallback(tabId) {
-  // Try to send scrape message to existing content script
-  chrome.tabs.sendMessage(tabId, { action: 'TRIGGER_SCRAPE' }, (response) => {
-    if (chrome.runtime.lastError) {
-      // Content script not found, inject it dynamically
-      console.log('JobPipe: Content script not found in tab', tabId, '- injecting dynamically');
-      chrome.scripting.executeScript({
-        target: { tabId: tabId },
-        files: ['content/content_script.js']
-      }).then(() => {
-        console.log('JobPipe: Content script injected into tab', tabId);
-        // Wait for script to initialize, then send scrape message
-        setTimeout(() => {
-          chrome.tabs.sendMessage(tabId, { action: 'TRIGGER_SCRAPE' }, (response) => {
-            if (chrome.runtime.lastError) {
-              console.log('JobPipe: Error after injection:', chrome.runtime.lastError.message);
-            } else {
-              console.log('JobPipe: Scrape triggered after injection', response);
-            }
-          });
-        }, 1000);
-      }).catch((error) => {
-        console.error('JobPipe: Failed to inject content script:', error);
-      });
-    } else {
-      console.log('JobPipe: Triggered scrape on tab', tabId, response);
+  // Check if tab still exists before trying to message it
+  chrome.tabs.get(tabId, (tab) => {
+    if (chrome.runtime.lastError || !tab) {
+      console.warn('JobPipe: Tab', tabId, 'no longer exists, skipping scrape');
+      return;
     }
+
+    // Try to send scrape message to existing content script
+    chrome.tabs.sendMessage(tabId, { action: 'TRIGGER_SCRAPE' }, (response) => {
+      if (chrome.runtime.lastError) {
+        // Content script not found, inject it dynamically
+        console.log('JobPipe: Content script not found in tab', tabId, '- injecting dynamically');
+        chrome.scripting.executeScript({
+          target: { tabId: tabId },
+          files: ['content/content_script.js']
+        }).then(() => {
+          console.log('JobPipe: Content script injected into tab', tabId);
+          // Wait for script to initialize, then send scrape message with retry
+          setTimeout(() => {
+            chrome.tabs.sendMessage(tabId, { action: 'TRIGGER_SCRAPE' }, (response) => {
+              if (chrome.runtime.lastError) {
+                console.log('JobPipe: Error after injection (retrying once):', chrome.runtime.lastError.message);
+                // Retry once after another short delay
+                setTimeout(() => {
+                  chrome.tabs.sendMessage(tabId, { action: 'TRIGGER_SCRAPE' }, (response2) => {
+                    if (chrome.runtime.lastError) {
+                      console.log('JobPipe: Retry failed:', chrome.runtime.lastError.message);
+                    } else {
+                      console.log('JobPipe: Scrape triggered on retry', response2);
+                    }
+                  });
+                }, 500);
+              } else {
+                console.log('JobPipe: Scrape triggered after injection', response);
+              }
+            });
+          }, 1500); // Increased delay to ensure script is fully loaded
+        }).catch((error) => {
+          console.error('JobPipe: Failed to inject content script:', error);
+        });
+      } else {
+        console.log('JobPipe: Triggered scrape on tab', tabId, response);
+      }
+    });
   });
 }
 

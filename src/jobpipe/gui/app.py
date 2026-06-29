@@ -5,10 +5,18 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from datetime import datetime
 from pathlib import Path
 import sys
 from typing import Callable
+
+# Configure logging to see debug messages
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 from jobpipe.config import Settings
 from jobpipe.gui.latex_editor import LatexEditor
@@ -19,6 +27,7 @@ from jobpipe.scoring.attainability import _infer_seniority_hint
 try:
     from PySide6.QtCore import (
         QEasingCurve,
+        QDateTime,
         QFileSystemWatcher,
         QObject,
         QPropertyAnimation,
@@ -29,7 +38,7 @@ try:
         QUrl,
         Signal,
     )
-    from PySide6.QtGui import QAction, QDesktopServices, QFont, QKeySequence, QShortcut
+    from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QKeySequence, QLinearGradient, QShortcut
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -39,19 +48,27 @@ try:
         QGridLayout,
         QGroupBox,
         QHBoxLayout,
+        QHeaderView,
         QLabel,
         QLineEdit,
         QMainWindow,
+        QMenu,
+        QMenuBar,
         QMessageBox,
         QPlainTextEdit,
         QPushButton,
+        QProgressBar,
+        QScrollArea,
         QSlider,
         QSpinBox,
         QSplitter,
-        QMenu,
+        QSizePolicy,
+        QStatusBar,
+        QTabBar,
+        QTabWidget,
         QTableWidget,
         QTableWidgetItem,
-        QTabWidget,
+        QTextEdit,
         QVBoxLayout,
         QWidget,
     )
@@ -110,7 +127,7 @@ class BackgroundActionWorker(QRunnable):
 
 class RecommendSignals(QObject):
     """Signals for the AI recommendation worker."""
-    succeeded = Signal(str)  # recommendation text
+    succeeded = Signal(object)  # recommendation text (or tuple of (text, priority_levels))
     failed = Signal(str)  # error message
     completed = Signal()
 
@@ -126,8 +143,14 @@ class RecommendWorker(QRunnable):
 
     def run(self) -> None:
         try:
-            recommendation = self._service.generate_ai_recommendations(self._top_jobs)
-            self.signals.succeeded.emit(recommendation)
+            result = self._service.generate_ai_recommendations(self._top_jobs)
+            # Handle both old (string) and new (tuple) return types
+            if isinstance(result, tuple):
+                recommendation, priority_levels = result
+                self.signals.succeeded.emit((recommendation, priority_levels))
+            else:
+                # Old return type - just string
+                self.signals.succeeded.emit((result, None))
         except Exception as exc:
             self.signals.failed.emit(str(exc))
         finally:
@@ -135,11 +158,12 @@ class RecommendWorker(QRunnable):
 
 
 class AIRecommendPanel(QWidget):
-    """Collapsible right sidebar panel for AI recommendations (Copilot style)."""
+    """Chat-style panel for AI recommendations with better visual feedback."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._job_ids: list[str] = []  # Track which jobs were recommended
+        self._chat_messages: list[tuple[str, str]] = []  # (role, message) pairs
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -149,9 +173,9 @@ class AIRecommendPanel(QWidget):
 
         # Header with title and collapse button
         header_layout = QHBoxLayout()
-        title = QLabel("✨ AI Recommendations")
+        title = QLabel("✨ AI Career Advisor")
         title.setObjectName("cardTitle")
-        title.setStyleSheet("color: #e94560; font-weight: bold;")
+        title.setStyleSheet("color: #e94560; font-weight: bold; font-size: 11pt;")
         header_layout.addWidget(title)
         header_layout.addStretch(1)
 
@@ -162,59 +186,231 @@ class AIRecommendPanel(QWidget):
         header_layout.addWidget(self._collapse_btn)
         layout.addLayout(header_layout)
 
-        # Recommendation text display
-        self._text_display = QPlainTextEdit()
-        self._text_display.setReadOnly(True)
-        self._text_display.setPlaceholderText("Click 'AI Recommend' to generate recommendations...")
-        self._text_display.setMaximumHeight(300)
-        layout.addWidget(self._text_display)
+        # Chat display area (scrollable)
+        self._chat_scroll = QScrollArea()
+        self._chat_scroll.setWidgetResizable(True)
+        self._chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._chat_scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background: #1a1a2e;
+            }
+        """)
+        
+        self._chat_widget = QWidget()
+        self._chat_layout = QVBoxLayout(self._chat_widget)
+        self._chat_layout.setContentsMargins(6, 6, 6, 6)
+        self._chat_layout.setSpacing(8)
+        self._chat_layout.addStretch(1)  # Push messages to bottom
+        
+        self._chat_scroll.setWidget(self._chat_widget)
+        layout.addWidget(self._chat_scroll, 1)  # Stretch factor 1
 
-        # AI Picks section
-        picks_label = QLabel("AI Picks:")
-        picks_label.setObjectName("cardTitle")
-        picks_label.setStyleSheet("color: #a0a0a0; font-size: 9pt;")
-        layout.addWidget(picks_label)
+        # Progress indicator (hidden by default)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 0)  # Indeterminate
+        self._progress_bar.setVisible(False)
+        self._progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #533483;
+                border-radius: 3px;
+                background: #0f0f1e;
+                height: 8px;
+            }
+            QProgressBar::chunk {
+                background: QLinearGradient(x1:0, y1:0, x2:1, y2:0, stop:0 #533483, stop:1 #e94560);
+                border-radius: 2px;
+            }
+        """)
+        layout.addWidget(self._progress_bar)
 
-        self._picks_list = QPlainTextEdit()
-        self._picks_list.setReadOnly(True)
-        self._picks_list.setMaximumHeight(150)
-        self._picks_list.setPlaceholderText("Top picks will appear here...")
-        layout.addWidget(self._picks_list)
+        # Input area for follow-up questions (future feature)
+        input_layout = QHBoxLayout()
+        self._input_field = QLineEdit()
+        self._input_field.setPlaceholderText("Ask a follow-up question...")
+        self._input_field.setEnabled(False)  # Disabled for now
+        self._send_button = QPushButton("Send")
+        self._send_button.setEnabled(False)  # Disabled for now
+        input_layout.addWidget(self._input_field, 1)
+        input_layout.addWidget(self._send_button)
+        layout.addLayout(input_layout)
 
+        # Apply dark theme styling
         self.setStyleSheet("""
             AIRecommendPanel {
                 background: #1a1a2e;
                 border-left: 2px solid #533483;
             }
+            QLineEdit {
+                background: #0f0f1e;
+                border: 1px solid #533483;
+                border-radius: 4px;
+                padding: 4px;
+                color: #e0e0e0;
+            }
+            QPushButton {
+                background: #533483;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 12px;
+                color: white;
+            }
+            QPushButton:disabled {
+                background: #2a2a3e;
+                color: #6a6a7a;
+            }
         """)
+
+    def _add_message(self, role: str, message: str, priority_colors: list[str] = None) -> None:
+        """Add a chat message bubble.
+        
+        Args:
+            role: 'user' or 'ai'
+            message: Message text
+            priority_colors: List of colors for priority items (for AI messages)
+        """
+        # Create message bubble
+        bubble = QFrame()
+        bubble.setFrameStyle(QFrame.Shape.Box)
+        
+        bubble_layout = QVBoxLayout(bubble)
+        bubble_layout.setContentsMargins(8, 6, 8, 6)
+        
+        # Role label
+        role_label = QLabel("🧑 You" if role == "user" else "✨ AI Advisor")
+        role_label.setStyleSheet(
+            f"color: {'#4a9eff' if role == 'user' else '#e94560'}; "
+            f"font-weight: bold; font-size: 9pt;"
+        )
+        bubble_layout.addWidget(role_label)
+        
+        # Message text
+        if role == "ai" and priority_colors:
+            # Parse message and apply color coding
+            text_display = self._create_colored_message(message, priority_colors)
+            bubble_layout.addWidget(text_display)
+        else:
+            msg_label = QLabel(message)
+            msg_label.setWordWrap(True)
+            msg_label.setStyleSheet("color: #e0e0e0; font-size: 9pt; padding: 4px 0;")
+            bubble_layout.addWidget(msg_label)
+        
+        # Style the bubble
+        if role == "user":
+            bubble.setStyleSheet("""
+                QFrame {
+                    background: #1a2a3e;
+                    border: 1px solid #2a4a6e;
+                    border-radius: 8px;
+                    margin-left: 20px;
+                }
+            """)
+        else:
+            bubble.setStyleSheet("""
+                QFrame {
+                    background: #1a1a2e;
+                    border: 1px solid #533483;
+                    border-radius: 8px;
+                    margin-right: 20px;
+                }
+            """)
+        
+        # Insert before the stretch
+        self._chat_layout.insertWidget(self._chat_layout.count() - 1, bubble)
+        
+        # Scroll to bottom
+        QTimer.singleShot(50, lambda: self._chat_scroll.verticalScrollBar().setValue(
+            self._chat_scroll.verticalScrollBar().maximum()
+        ))
+
+    def _create_colored_message(self, message: str, priority_colors: list[str]) -> QTextEdit:
+        """Create a text edit with color-coded priority items."""
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setMaximumHeight(200)
+        
+        # Parse the message and apply colors
+        html = message.replace("\n", "<br>")
+        
+        # Apply priority colors to numbered items
+        for i, color in enumerate(priority_colors, 1):
+            # Look for patterns like "1.", "2.", etc.
+            old_pattern = f"{i}. "
+            if color == "green":
+                new_pattern = f'<span style="color: #4caf50; font-weight: bold;">{i}. </span>'
+            elif color == "yellow":
+                new_pattern = f'<span style="color: #ffc107; font-weight: bold;">{i}. </span>'
+            else:  # purple
+                new_pattern = f'<span style="color: #9c27b0; font-weight: bold;">{i}. </span>'
+            html = html.replace(old_pattern, new_pattern, 1)
+        
+        text_edit.setHtml(f'<div style="color: #e0e0e0; font-size: 9pt;">{html}</div>')
+        return text_edit
 
     def _toggle_collapse(self) -> None:
         """Toggle panel visibility."""
-        is_visible = self._text_display.isVisible()
-        self._text_display.setVisible(not is_visible)
-        self._picks_list.setVisible(not is_visible)
+        is_visible = self._chat_scroll.isVisible()
+        self._chat_scroll.setVisible(not is_visible)
+        self._progress_bar.setVisible(False)  # Always hide progress when collapsing
+        self._input_field.setVisible(not is_visible)
+        self._send_button.setVisible(not is_visible)
         self._collapse_btn.setText("▶" if is_visible else "◀")
         self._collapse_btn.setToolTip("Expand panel" if is_visible else "Collapse panel")
 
-    def update_recommendations(self, text: str, job_ids: list[str]) -> None:
-        """Update the panel with new recommendations."""
-        self._job_ids = job_ids
-        self._text_display.setPlainText(text)
-        
-        # Ensure widgets are visible (they might be hidden by collapse toggle)
-        self._text_display.setVisible(True)
-        self._picks_list.setVisible(True)
-        
-        # Also ensure the collapse button shows "◀" (expanded state)
-        if hasattr(self, '_collapse_btn'):
-            self._collapse_btn.setText("◀")  # Set to expanded state
-            self._collapse_btn.setToolTip("Collapse panel")
+    def show_progress(self, show: bool = True) -> None:
+        """Show or hide the progress indicator."""
+        self._progress_bar.setVisible(show)
+        if show:
+            self._add_message("ai", "🤔 Analyzing your top jobs and Master CV...\nGenerating personalized recommendations...")
+            self.setVisible(True)
+            self._chat_scroll.setVisible(True)
+            self._collapse_btn.setText("◀")
 
-        # Extract job titles from recommendations for the picks list
-        picks = []
-        for i, job_id in enumerate(job_ids[:5], 1):  # Top 5
-            picks.append(f"{i}. Job ID: {job_id}")
-        self._picks_list.setPlainText("\n".join(picks))
+    def update_recommendations(self, text: str, job_ids: list[str], priority_levels: list[str] = None) -> None:
+        """Update the panel with new recommendations.
+        
+        Args:
+            text: AI recommendation text
+            job_ids: List of recommended job IDs
+            priority_levels: List of 'high', 'medium', 'low' for color coding
+        """
+        self._job_ids = job_ids
+        
+        # Hide progress bar
+        self._progress_bar.setVisible(False)
+        
+        # Determine colors based on priority levels
+        colors = []
+        if priority_levels:
+            for level in priority_levels[:5]:
+                if level == "high":
+                    colors.append("green")
+                elif level == "medium":
+                    colors.append("yellow")
+                else:
+                    colors.append("purple")
+        else:
+            # Default: first 2 are high (green), next 2 medium (yellow), last low (purple)
+            colors = ["green", "green", "yellow", "yellow", "purple"][:len(job_ids[:5])]
+        
+        # Add AI response as chat message with color coding
+        self._add_message("ai", text, colors)
+        
+        # Ensure panel is visible and expanded
+        self.setVisible(True)
+        self._chat_scroll.setVisible(True)
+        self._input_field.setVisible(True)
+        self._send_button.setVisible(True)
+        self._collapse_btn.setText("◀")
+        self._collapse_btn.setToolTip("Collapse panel")
+        
+        # Store the recommendation for potential follow-up
+        self._chat_messages.append(("ai", text))
+
+    def add_user_query(self, query: str) -> None:
+        """Add a user query to the chat (for future interactive feature)."""
+        self._add_message("user", query)
+        self._chat_messages.append(("user", query))
 
     def get_job_ids(self) -> list[str]:
         """Return the list of AI-picked job IDs."""
@@ -243,10 +439,21 @@ class JobPipeMainWindow(QMainWindow):
         self._enrichment_initial_desc_length: int = 0
         self._pending_stage_after_enrichment: bool = False  # Flag for double-click staging
 
-        # Auto-refresh timer for database updates
+        # Auto-refresh timer for database updates (single-shot to prevent overlapping refreshes)
         self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.setSingleShot(True)  # Only fire once per start
         self._auto_refresh_timer.setInterval(30000)  # Refresh every 30 seconds
-        self._auto_refresh_timer.timeout.connect(self.refresh_views)
+        self._auto_refresh_timer.timeout.connect(self._auto_refresh_silent)
+        self._auto_refresh_silent_flag = False  # Flag to suppress modal dialogs
+        self._refresh_in_progress = False  # Guard against concurrent refreshes
+        self._refresh_watchdog = QTimer(self)  # Watchdog to kill hung refreshes
+        self._refresh_watchdog.setSingleShot(True)
+        self._refresh_watchdog.setInterval(10000)  # 10 second timeout
+        self._refresh_watchdog.timeout.connect(self._refresh_timeout)
+
+        # Pagination state
+        self._jobs_current_page = 1
+        self._jobs_total_pages = 1
 
         self._ingest_status_value = QLabel("Starting")
         self._ingest_endpoint_value = QLabel("n/a")
@@ -302,6 +509,23 @@ class JobPipeMainWindow(QMainWindow):
         self._jobs_count_label = QLabel("Jobs: 0 | Companies: 0")
         self._jobs_count_label.setProperty("role", "muted")
 
+        # Pagination controls
+        self._jobs_current_page = 1
+        self._jobs_total_pages = 1
+        self._jobs_page_size = QSpinBox()
+        self._jobs_page_size.setRange(50, 500)
+        self._jobs_page_size.setSingleStep(50)
+        self._jobs_page_size.setValue(100)
+        self._jobs_page_size.setSuffix(" per page")
+        self._jobs_prev_button = QPushButton("◀ Prev")
+        self._jobs_prev_button.clicked.connect(self._on_prev_page)
+        self._jobs_prev_button.setEnabled(False)
+        self._jobs_next_button = QPushButton("Next ▶")
+        self._jobs_next_button.clicked.connect(self._on_next_page)
+        self._jobs_next_button.setEnabled(False)
+        self._jobs_page_info = QLabel("Page 1 of 1")
+        self._jobs_page_info.setProperty("role", "muted")
+
         # --- Jobs tab sidebar filter controls ---
         # Seniority filter checkboxes (all checked = show all)
         self._filter_seniority_entry = QCheckBox("Entry / Junior")
@@ -353,42 +577,6 @@ class JobPipeMainWindow(QMainWindow):
         self._filter_max_job_age.setValue(30)
         self._filter_max_job_age.setSuffix(" days")
 
-        # --- Job Preferences (moved from Settings tab) ---
-        self._filter_notification_threshold = QLineEdit()
-        self._filter_notification_threshold.setPlaceholderText("0.00")
-        self._filter_user_years = QLineEdit()
-        self._filter_user_years.setPlaceholderText("1")
-        self._filter_critical_skills = QLineEdit()
-        self._filter_critical_skills.setPlaceholderText("python,fastapi,sql,aws")
-        self._filter_reject_terms = QLineEdit()
-        self._filter_reject_terms.setPlaceholderText("senior,staff,principal,architect")
-        self._filter_auto_stage = QCheckBox("Enable auto-stage job description")
-        self._filter_auto_stage.setChecked(True)
-
-        # --- Scoring Weights (moved from Settings tab) ---
-        self._filter_relevance_slider = QSlider(Qt.Orientation.Horizontal)
-        self._filter_relevance_slider.setRange(0, 100)
-        self._filter_relevance_slider.setValue(50)
-        self._filter_relevance_label = QLabel("Relevance: 0.50")
-        
-        self._filter_attainability_slider = QSlider(Qt.Orientation.Horizontal)
-        self._filter_attainability_slider.setRange(0, 100)
-        self._filter_attainability_slider.setValue(30)
-        self._filter_attainability_label = QLabel("Attainability: 0.30")
-        
-        self._filter_recency_slider = QSlider(Qt.Orientation.Horizontal)
-        self._filter_recency_slider.setRange(0, 100)
-        self._filter_recency_slider.setValue(20)
-        self._filter_recency_label = QLabel("Recency: 0.20")
-
-        # --- Age Filter ---
-        self._filter_reject_old_jobs = QCheckBox("Reject jobs that are too old")
-        self._filter_reject_old_jobs.setChecked(True)
-        self._filter_max_job_age = QSpinBox()
-        self._filter_max_job_age.setRange(1, 365)
-        self._filter_max_job_age.setValue(30)
-        self._filter_max_job_age.setSuffix(" days")
-
         # Score minimum sliders (0 = no filter)
         self._filter_min_total = QSlider(Qt.Orientation.Horizontal)
         self._filter_min_total.setRange(0, 100)
@@ -431,12 +619,25 @@ class JobPipeMainWindow(QMainWindow):
         self.setWindowTitle("JobPipe Desktop")
         self.resize(1300, 800)
         self._apply_theme()
+        self._append_log("Initializing UI...")
         self._build_ui()
+        self._append_log("UI built successfully")
         self.statusBar().showMessage("Ready")
+        
+        self._append_log("Starting ingest server...")
         self._start_ingest_server()
+        self._append_log("Ingest server start sequence completed")
+        
+        self._append_log("Refreshing views (this may take a while)...")
         self.refresh_views()
+        self._append_log("Initial view refresh completed")
+        
+        self._append_log("Loading settings...")
         self._load_settings_form_values(silent=True)
+        self._append_log("Settings loaded")
+        
         self._auto_refresh_timer.start()  # Start auto-refresh
+        self._append_log("Auto-refresh timer started - initialization complete")
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._ingest_server is not None:
@@ -524,7 +725,7 @@ class JobPipeMainWindow(QMainWindow):
                 background: #1a1a2e;
                 border: 1px solid #0f3460;
                 border-radius: 8px;
-                padding: 8px;
+                padding: 4px;
             }
             QTabBar::tab {
                 background: #16213e;
@@ -688,8 +889,8 @@ class JobPipeMainWindow(QMainWindow):
         header = QFrame()
         header.setObjectName("headerBar")
         layout = QHBoxLayout(header)
-        layout.setContentsMargins(12, 6, 12, 6)
-        layout.setSpacing(12)
+        layout.setContentsMargins(10, 5, 10, 5)
+        layout.setSpacing(10)
 
         title = QLabel("JobPipe Control Center")
         title.setObjectName("pageTitle")
@@ -755,8 +956,8 @@ class JobPipeMainWindow(QMainWindow):
         central = QWidget(self)
         central.setObjectName("appRoot")
         root = QVBoxLayout(central)
-        root.setContentsMargins(18, 16, 18, 18)
-        root.setSpacing(12)
+        root.setContentsMargins(12, 10, 12, 12)
+        root.setSpacing(8)
 
         root.addWidget(self._build_header())
 
@@ -837,14 +1038,17 @@ class JobPipeMainWindow(QMainWindow):
     def _build_jobs_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
 
         # ---- Top bar: counts + search + actions ----
         counts_layout = QHBoxLayout()
         counts_layout.setContentsMargins(0, 0, 0, 0)
-        counts_layout.setSpacing(6)
-        self._jobs_count_label.setMaximumHeight(20)
-        self._jobs_results_label.setMaximumHeight(20)
+        counts_layout.setSpacing(8)
+        self._jobs_count_label.setWordWrap(False)
+        self._jobs_results_label.setWordWrap(False)
+        self._jobs_count_label.setMinimumWidth(220)
+        self._jobs_results_label.setMinimumWidth(360)
         counts_layout.addWidget(self._jobs_count_label)
         counts_layout.addWidget(self._jobs_results_label)
         counts_layout.addStretch(1)
@@ -852,7 +1056,7 @@ class JobPipeMainWindow(QMainWindow):
 
         controls = QHBoxLayout()
         controls.setContentsMargins(0, 0, 0, 0)
-        controls.setSpacing(4)
+        controls.setSpacing(6)
         search_label = QLabel("Search:")
         search_label.setProperty("role", "formLabel")
         controls.addWidget(search_label)
@@ -889,43 +1093,78 @@ class JobPipeMainWindow(QMainWindow):
         self._recommend_button.clicked.connect(self._get_ai_recommendations)
         controls.addWidget(self._recommend_button)
 
+        # Refresh button for Jobs tab
+        refresh_jobs_button = QPushButton("Refresh Jobs")
+        refresh_jobs_button.setObjectName("primaryButton")
+        refresh_jobs_button.clicked.connect(self._refresh_jobs_tab)
+        controls.addWidget(refresh_jobs_button)
+
         controls.addStretch(1)
         layout.addLayout(controls)
 
         # ---- Body: sidebar | table+details ----
         body_splitter = QSplitter(Qt.Orientation.Horizontal)
+        body_splitter.setChildrenCollapsible(False)
+        body_splitter.setHandleWidth(6)
 
-        # -- Sidebar filters --
+        # -- Sidebar filters (wrapped in QScrollArea to prevent compression) --
+        sidebar_scroll = QScrollArea()
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sidebar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        sidebar_scroll.setMinimumWidth(260)
+        sidebar_scroll.setMaximumWidth(360)
+        sidebar_scroll.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        sidebar_scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+            QScrollBar:vertical {
+                background: #1a1a2e;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: #533483;
+                border-radius: 6px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #e94560;
+            }
+        """)
+
         sidebar = QFrame()
         sidebar.setProperty("role", "card")
-        sidebar.setMinimumWidth(180)  # Reduced from 200
-        sidebar.setMaximumWidth(240)  # Reduced from 280
+        sidebar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(6, 6, 6, 6)  # Tighter margins
-        sidebar_layout.setSpacing(4)  # Reduced spacing
+        sidebar_layout.setContentsMargins(6, 6, 6, 6)
+        sidebar_layout.setSpacing(5)
 
         # Filters header
         filters_header = QLabel("Filters")
         filters_header.setObjectName("cardTitle")
-        filters_header.setMaximumHeight(20)  # Smaller header
+        filters_header.setWordWrap(False)
+        filters_header.setMinimumHeight(24)
         sidebar_layout.addWidget(filters_header)
 
-        # Seniority group - compact
+        # Seniority group
         seniority_group = QGroupBox("Seniority")
         seniority_group_layout = QVBoxLayout(seniority_group)
-        seniority_group_layout.setSpacing(1)  # Tighter spacing
-        seniority_group_layout.setContentsMargins(6, 4, 6, 4)  # Tighter margins
+        seniority_group_layout.setSpacing(6)
+        seniority_group_layout.setContentsMargins(10, 8, 10, 8)
         seniority_group_layout.addWidget(self._filter_seniority_entry)
         seniority_group_layout.addWidget(self._filter_seniority_mid)
         seniority_group_layout.addWidget(self._filter_seniority_senior)
         seniority_group_layout.addWidget(self._filter_seniority_manager)
         sidebar_layout.addWidget(seniority_group)
 
-        # Score sliders group with explicit labels - compact
+        # Score sliders group with explicit labels
         score_group = QGroupBox("Minimum Scores")
         score_group_layout = QVBoxLayout(score_group)
-        score_group_layout.setSpacing(2)  # Tighter spacing
-        score_group_layout.setContentsMargins(6, 4, 6, 4)  # Tighter margins
+        score_group_layout.setSpacing(8)
+        score_group_layout.setContentsMargins(10, 8, 10, 8)
 
         self._filter_min_total_label = QLabel("Min Total: 0.00")
         self._filter_min_total.valueChanged.connect(
@@ -950,12 +1189,12 @@ class JobPipeMainWindow(QMainWindow):
 
         sidebar_layout.addWidget(score_group)
 
-        # ---- Job Preferences Group ---- compact
+        # ---- Job Preferences Group ----
         prefs_group = QGroupBox("Job Preferences")
         prefs_layout = QFormLayout(prefs_group)
-        prefs_layout.setSpacing(2)  # Tighter spacing
-        prefs_layout.setContentsMargins(6, 4, 6, 4)  # Tighter margins
-        prefs_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)  # Smaller fields
+        prefs_layout.setSpacing(8)
+        prefs_layout.setContentsMargins(10, 8, 10, 8)
+        prefs_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         prefs_layout.addRow("Notification Threshold", self._filter_notification_threshold)
         prefs_layout.addRow("User Years Exp.", self._filter_user_years)
         prefs_layout.addRow("Critical Skills (CSV)", self._filter_critical_skills)
@@ -963,11 +1202,11 @@ class JobPipeMainWindow(QMainWindow):
         prefs_layout.addRow(self._filter_auto_stage)
         sidebar_layout.addWidget(prefs_group)
 
-        # ---- Scoring Weights Group ---- compact
+        # ---- Scoring Weights Group ----
         weights_group = QGroupBox("Scoring Weights")
         weights_layout = QVBoxLayout(weights_group)
-        weights_layout.setSpacing(2)  # Tighter spacing
-        weights_layout.setContentsMargins(6, 4, 6, 4)  # Tighter margins
+        weights_layout.setSpacing(8)
+        weights_layout.setContentsMargins(10, 8, 10, 8)
         
         # Connect sliders to update labels
         self._filter_relevance_slider.valueChanged.connect(
@@ -988,11 +1227,11 @@ class JobPipeMainWindow(QMainWindow):
         weights_layout.addWidget(self._filter_recency_slider)
         sidebar_layout.addWidget(weights_group)
 
-        # ---- Age Filter Group ---- compact
+        # ---- Age Filter Group ----
         age_group = QGroupBox("Age Filter")
         age_layout = QVBoxLayout(age_group)
-        age_layout.setSpacing(2)  # Tighter spacing
-        age_layout.setContentsMargins(6, 4, 6, 4)  # Tighter margins
+        age_layout.setSpacing(8)
+        age_layout.setContentsMargins(10, 8, 10, 8)
         age_layout.addWidget(self._filter_reject_old_jobs)
         age_layout.addWidget(QLabel("Max Job Age:"))
         age_layout.addWidget(self._filter_max_job_age)
@@ -1010,15 +1249,20 @@ class JobPipeMainWindow(QMainWindow):
         sidebar_layout.addWidget(reset_filters_btn)
 
         sidebar_layout.addStretch(1)
-        body_splitter.addWidget(sidebar)
+        
+        # Wrap sidebar in scroll area
+        sidebar_scroll.setWidget(sidebar)
+        body_splitter.addWidget(sidebar_scroll)
 
         # -- Middle panel: table + details --
         middle_panel = QWidget()
         middle_layout = QVBoxLayout(middle_panel)
         middle_layout.setContentsMargins(0, 0, 0, 0)
-        middle_layout.setSpacing(6)
+        middle_layout.setSpacing(4)
 
         vert_splitter = QSplitter(Qt.Orientation.Vertical)
+        vert_splitter.setChildrenCollapsible(False)
+        vert_splitter.setHandleWidth(6)
         vert_splitter.addWidget(self._jobs_table)
 
         # Job details panel
@@ -1037,6 +1281,7 @@ class JobPipeMainWindow(QMainWindow):
         vert_splitter.addWidget(details_panel)
         vert_splitter.setStretchFactor(0, 3)
         vert_splitter.setStretchFactor(1, 1)
+        vert_splitter.setSizes([720, 240])
 
         middle_layout.addWidget(vert_splitter)
         body_splitter.addWidget(middle_panel)
@@ -1054,6 +1299,7 @@ class JobPipeMainWindow(QMainWindow):
         body_splitter.setStretchFactor(0, 0)  # Sidebar fixed width
         body_splitter.setStretchFactor(1, 1)  # Middle panel expands
         body_splitter.setStretchFactor(2, 0)  # AI panel hidden by default
+        body_splitter.setSizes([300, 900, 0])
         layout.addWidget(body_splitter)
 
         # Connect selection change to show details
@@ -1074,6 +1320,10 @@ class JobPipeMainWindow(QMainWindow):
 
     def _clear_job_search(self) -> None:
         self._jobs_search_input.clear()
+        self.refresh_views()
+
+    def _refresh_jobs_tab(self) -> None:
+        """Refresh the jobs tab by reloading jobs from database."""
         self.refresh_views()
 
     def _build_runs_tab(self) -> QWidget:
@@ -1276,6 +1526,18 @@ class JobPipeMainWindow(QMainWindow):
         # Trigger re-scoring in background
         self._rescore_jobs_async()
     
+    def _on_prev_page(self) -> None:
+        """Handle previous page button click."""
+        if self._jobs_current_page > 1:
+            self._jobs_current_page -= 1
+            self.refresh_views()
+    
+    def _on_next_page(self) -> None:
+        """Handle next page button click."""
+        if self._jobs_current_page < self._jobs_total_pages:
+            self._jobs_current_page += 1
+            self.refresh_views()
+    
     def _rescore_jobs_async(self) -> None:
         """Re-score all jobs with current CV in background thread."""
         def do_rescore():
@@ -1380,7 +1642,7 @@ class JobPipeMainWindow(QMainWindow):
         # Step 2: Review & Compile
         step2_layout = QHBoxLayout()
         step2_layout.setSpacing(4)
-        step2_label = QLabel("2. Review LaTeX & Compile")
+        step2_label = QLabel("2. Review")
         step2_label.setProperty("role", "formLabel")
         step2_layout.addWidget(step2_label)
         step2_layout.addStretch(1)
@@ -1475,19 +1737,33 @@ class JobPipeMainWindow(QMainWindow):
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         table.setAlternatingRowColors(True)
+        table.setWordWrap(False)
+        table.setTextElideMode(Qt.TextElideMode.ElideRight)
         table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(28)
-        table.horizontalHeader().setStretchLastSection(True)
+        header = table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter)
+        header.setMinimumSectionSize(48)
+        for column, _ in enumerate(headers):
+            if column == 5:
+                header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
+            else:
+                header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         table.setSortingEnabled(False)
         return table
 
     def _start_ingest_server(self) -> None:
         try:
+            self._append_log("Creating ingest server instance...")
             self._ingest_server = self._service.create_ingest_server()
+            self._append_log("Starting ingest server...")
             self._ingest_server.start()
             self._ingest_status_value.setText("Running")
             self._ingest_endpoint_value.setText(self._ingest_server.endpoint())
-            self._append_log("Ingest server started")
+            self._append_log(f"Ingest server started at {self._ingest_server.endpoint()}")
         except Exception as exc:
             self._ingest_status_value.setText("Failed")
             self._ingest_endpoint_value.setText(self._service.ingest_endpoint())
@@ -1557,37 +1833,112 @@ class JobPipeMainWindow(QMainWindow):
             filtered.append(job)
         return filtered
 
-    def refresh_views(self) -> None:
+    def _auto_refresh_silent(self) -> None:
+        """Auto-refresh callback that suppresses modal dialogs."""
+        self._auto_refresh_silent_flag = True
         try:
-            snapshot = self._service.dashboard_snapshot()
-            search_query = self._jobs_search_input.text().strip() or None
-            jobs = self._service.list_jobs(
-                limit=self._jobs_limit_input.value(),
-                search_query=search_query,
-            )
-            # Apply sidebar filters (client-side, opt-in)
-            jobs = self._filter_jobs_list(jobs)
+            self.refresh_views()
+        finally:
+            self._auto_refresh_silent_flag = False
+            # Restart timer after refresh completes (single-shot mode)
+            if hasattr(self, '_auto_refresh_timer'):
+                self._auto_refresh_timer.start()
+    
+    def _refresh_timeout(self) -> None:
+        """Watchdog handler: kill refresh if it takes too long."""
+        if hasattr(self, '_refresh_in_progress') and self._refresh_in_progress:
+            self._append_log("Refresh timeout: forcing reset after 10 seconds")
+            self._refresh_in_progress = False
+            self._refresh_watchdog.stop()
 
-            runs = self._service.list_recent_runs(limit=200)
-            notifications = self._service.list_recent_notifications(limit=200)
-            job_count, company_count = self._service.get_jobs_and_companies_count()
+    def refresh_views(self) -> None:
+        # Skip refresh if already in progress to prevent concurrent database access
+        if hasattr(self, '_refresh_in_progress') and self._refresh_in_progress:
+            self._append_log("Refresh skipped: already in progress")
+            return
+        
+        self._refresh_in_progress = True
+        self._refresh_start_time = QDateTime.currentDateTime()
+        
+        # Start watchdog timer (10 second timeout)
+        if hasattr(self, '_refresh_watchdog'):
+            self._refresh_watchdog.start()
+        
+        self._append_log("Refresh started - checking for concurrent refresh...")
+        
+        try:
+            search_query = self._jobs_search_input.text().strip() or None
+            page_size = self._jobs_page_size.value()
+            offset = (self._jobs_current_page - 1) * page_size
+            
+            self._append_log(f"Fetching data: page_size={page_size}, offset={offset}, search='{search_query}'")
+            
+            # Fetch all data in a single optimized batch query
+            self._append_log("Calling service.refresh_all_data()...")
+            (snapshot, jobs, total_jobs, runs, notifications, 
+             job_count, company_count) = self._service.refresh_all_data(
+                jobs_limit=page_size,
+                jobs_offset=offset,
+                jobs_search=search_query,
+                runs_limit=50,  # Reduced from 200
+                notifications_limit=50,  # Reduced from 200
+            )
+            self._append_log(f"Data fetched: {len(jobs)} jobs, {len(runs)} runs, {len(notifications)} notifications")
+            
+            # Calculate pagination
+            self._jobs_total_pages = max(1, (total_jobs + page_size - 1) // page_size)
+            if self._jobs_current_page > self._jobs_total_pages:
+                self._jobs_current_page = self._jobs_total_pages
+            self._append_log(f"Pagination calculated: page {self._jobs_current_page} of {self._jobs_total_pages}")
+            
+            # Apply sidebar filters (client-side, opt-in)
+            self._append_log("Applying sidebar filters...")
+            jobs = self._filter_jobs_list(jobs)
+            self._append_log(f"Filters applied, {len(jobs)} jobs after filtering")
         except Exception as exc:
             self._append_log(f"Refresh failed: {exc}")
-            QMessageBox.critical(self, "Refresh Failed", str(exc))
+            # Don't show modal dialog during auto-refresh to avoid blocking
+            if not self._auto_refresh_silent_flag:
+                QMessageBox.critical(self, "Refresh Failed", str(exc))
             return
+        finally:
+            self._refresh_in_progress = False
+            # Stop watchdog timer
+            if hasattr(self, '_refresh_watchdog'):
+                self._refresh_watchdog.stop()
+            # Log refresh duration
+            if hasattr(self, '_refresh_start_time'):
+                duration = self._refresh_start_time.msecsTo(QDateTime.currentDateTime())
+                self._append_log(f"Refresh completed in {duration}ms")
 
+        self._append_log("Populating dashboard...")
         self._populate_dashboard(snapshot)
+        self._append_log("Populating jobs table...")
         self._populate_jobs(jobs)
+        self._append_log("Populating runs table...")
         self._populate_runs(runs)
+        self._append_log("Populating notifications table...")
         self._populate_notifications(notifications)
+        self._append_log("Updating count labels...")
         self._jobs_count_label.setText(f"Jobs: {job_count} | Companies: {company_count}")
         search_text = search_query or "all jobs"
+        
+        # Update pagination UI
+        start_idx = offset + 1
+        end_idx = min(offset + len(jobs), total_jobs)
         self._jobs_results_label.setText(
-            f"Showing {len(jobs)} of up to {self._jobs_limit_input.value()} for {search_text}"
+            f"Showing {start_idx}-{end_idx} of {total_jobs} for {search_text}"
         )
+        self._jobs_page_info.setText(f"Page {self._jobs_current_page} of {self._jobs_total_pages}")
+        self._jobs_prev_button.setEnabled(self._jobs_current_page > 1)
+        self._jobs_next_button.setEnabled(self._jobs_current_page < self._jobs_total_pages)
 
         self.statusBar().showMessage("Data refreshed", 3000)
         self._append_log("UI data refreshed")
+        
+        # Restart the auto-refresh timer (single-shot mode)
+        if hasattr(self, '_auto_refresh_timer') and self._auto_refresh_timer.isActive():
+            self._auto_refresh_timer.start()
 
     def _populate_dashboard(self, snapshot: DashboardSnapshot) -> None:
         self._db_path_value.setText(str(self._service.settings.db_path))
@@ -1628,46 +1979,69 @@ class JobPipeMainWindow(QMainWindow):
         )
 
     def _populate_jobs(self, jobs: list) -> None:
+        _start = time.time()
         self._jobs_table.setSortingEnabled(False)
-        self._jobs_table.setRowCount(len(jobs))
+        self._jobs_table.setUpdatesEnabled(False)  # Disable updates during population
+        try:
+            self._jobs_table.setRowCount(len(jobs))
+            self._append_log(f"  setRowCount({len(jobs)}): {time.time() - _start:.2f}s")
 
-        for row, job in enumerate(jobs):
-            # Build posted display: prefer posted_ago (e.g., "2 hours ago") with date_posted as tooltip
-            posted_display = job.posted_ago or _format_datetime(job.date_posted)
-            # Infer seniority from title+description
-            seniority = _infer_seniority_hint(job.title, job.description or "")
+            for row, job in enumerate(jobs):
+                # Build posted display: prefer posted_ago (e.g., "2 hours ago") with date_posted as tooltip
+                posted_display = job.posted_ago or _format_datetime(job.date_posted)
+                # Infer seniority from title+description
+                seniority = _infer_seniority_hint(job.title, job.description or "")
+                
+                values = [
+                    _format_score(job.match_score),  # Total (col 0)
+                    _format_score(job.score_relevance),  # Relevance (col 1)
+                    _format_score(job.score_attainability),  # Attainability (col 2)
+                    _format_score(job.score_recency),  # Recency (col 3)
+                    seniority.capitalize(),  # Seniority (col 4)
+                    job.title,  # Title (col 5)
+                    job.company,  # Company (col 6)
+                    job.platform,  # Platform (col 7)
+                    job.status,  # Status (col 8)
+                    posted_display,  # Posted (col 9)
+                    job.url,  # URL (col 10)
+                ]
+                for column, text in enumerate(values):
+                    item = QTableWidgetItem(text)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    if column == 5:  # Title column stores job.id
+                        item.setData(Qt.ItemDataRole.UserRole, job.id)
+                        item.setToolTip(text)
+                    # Add tooltip with full date if using posted_ago
+                    if column == 9 and job.posted_ago:  # Posted column
+                        item.setToolTip(_format_datetime(job.date_posted))
+                    # Add tooltip for score columns showing "Why this score?"
+                    if column in [0, 1, 2, 3] and text != "n/a":
+                        score_type = ["Total", "Relevance", "Attainability", "Recency"][column]
+                        item.setToolTip(f"{score_type}: {text}\nClick for details")
+                    self._jobs_table.setItem(row, column, item)
+                
+                # Log progress every 25 rows to identify slow batches
+                if (row + 1) % 25 == 0 or row == len(jobs) - 1:
+                    self._append_log(f"  Populated rows 0..{row} ({row+1}/{len(jobs)}): {time.time() - _start:.2f}s")
             
-            values = [
-                _format_score(job.match_score),  # Total (col 0)
-                _format_score(job.score_relevance),  # Relevance (col 1)
-                _format_score(job.score_attainability),  # Attainability (col 2)
-                _format_score(job.score_recency),  # Recency (col 3)
-                seniority.capitalize(),  # Seniority (col 4)
-                job.title,  # Title (col 5)
-                job.company,  # Company (col 6)
-                job.platform,  # Platform (col 7)
-                job.status,  # Status (col 8)
-                posted_display,  # Posted (col 9)
-                job.url,  # URL (col 10)
-            ]
-            for column, text in enumerate(values):
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                if column == 5:  # Title column stores job.id
-                    item.setData(Qt.ItemDataRole.UserRole, job.id)
-                # Add tooltip with full date if using posted_ago
-                if column == 9 and job.posted_ago:  # Posted column
-                    item.setToolTip(_format_datetime(job.date_posted))
-                # Add tooltip for score columns showing "Why this score?"
-                if column in [0, 1, 2, 3] and text != "n/a":
-                    score_type = ["Total", "Relevance", "Attainability", "Recency"][column]
-                    item.setToolTip(f"{score_type}: {text}\nClick for details")
-                self._jobs_table.setItem(row, column, item)
+            self._append_log(f"  Items created and set: {time.time() - _start:.2f}s")
 
-        self._jobs_table.resizeColumnsToContents()
-        self._jobs_table.setSortingEnabled(True)
-        # Sort by Total score (column 0) descending by default
-        self._jobs_table.sortItems(0, Qt.SortOrder.DescendingOrder)
+            # Only resize columns on first load or when explicitly requested
+            if not hasattr(self, '_columns_resized') or not self._columns_resized:
+                self._append_log(f"Resizing columns to contents...")
+                _resize_start = time.time()
+                self._jobs_table.resizeColumnsToContents()
+                self._append_log(f"Columns resized: {time.time() - _resize_start:.2f}s")
+                self._columns_resized = True
+            else:
+                self._append_log(f"Skipping column resize (already done)")
+            
+            self._jobs_table.setSortingEnabled(True)
+            # Sort by Total score (column 0) descending by default
+            self._jobs_table.sortItems(0, Qt.SortOrder.DescendingOrder)
+            self._append_log(f"  sortItems done: {time.time() - _start:.2f}s")
+        finally:
+            self._jobs_table.setUpdatesEnabled(True)  # Re-enable updates
 
     def _apply_job_filters(self) -> None:
         """Apply search + sidebar filters and refresh the jobs view."""
@@ -1781,8 +2155,12 @@ class JobPipeMainWindow(QMainWindow):
             
             self._recommend_busy = True
             self._recommend_button.setEnabled(False)
-            self.statusBar().showMessage(f"Generating AI recommendations for top {len(top_jobs)} jobs...")
+            self.statusBar().showMessage(f"🤔 Generating AI recommendations for top {len(top_jobs)} jobs...")
             self._append_log(f"Requesting AI recommendations for top {len(top_jobs)} jobs (out of {len(all_jobs)} total)...")
+            
+            # Show progress in AI panel
+            if hasattr(self, '_ai_panel'):
+                self._ai_panel.show_progress(True)
             
             # Store job IDs for highlighting/sorting later
             self._last_recommend_job_ids = [job.id for job in top_jobs]
@@ -1809,41 +2187,60 @@ class JobPipeMainWindow(QMainWindow):
             self._recommend_button.setEnabled(True)
             self.statusBar().showMessage("Recommendation timed out")
 
-    def _on_recommend_finished(self, recommendation: str) -> None:
+    def _on_recommend_finished(self, result: object) -> None:
         """Handle successful AI recommendation generation."""
         self._append_log("AI recommendations received successfully")
         
+        # Handle both old (string) and new (tuple) return types
+        if isinstance(result, tuple):
+            recommendation, priority_levels = result
+        else:
+            # Old return type - just string
+            recommendation = result
+            priority_levels = None
+        
         # Extract job IDs from the top_jobs that were sent to AI
-        # (We need to store these during the request)
         top_job_ids = getattr(self, '_last_recommend_job_ids', [])
         
-        # Update the AI Recommendation panel (right sidebar)
+        # If priority levels not provided by service, determine them based on job scores
+        if priority_levels is None:
+            priority_levels = []
+            try:
+                # Get the actual job objects to check their scores
+                all_jobs = self._service.list_jobs(limit=1000)
+                job_map = {job.id: job for job in all_jobs}
+                
+                for job_id in top_job_ids[:5]:
+                    job = job_map.get(job_id)
+                    if job and job.match_score:
+                        if job.match_score >= 0.8:
+                            priority_levels.append("high")
+                        elif job.match_score >= 0.6:
+                            priority_levels.append("medium")
+                        else:
+                            priority_levels.append("low")
+                    else:
+                        priority_levels.append("medium")  # Default
+            except Exception:
+                # If we can't determine priorities, use default
+                priority_levels = ["high", "high", "medium", "medium", "low"][:len(top_job_ids[:5])]
+        
+        # Update the AI Recommendation panel with chat-style interface
         if hasattr(self, '_ai_panel'):
-            self._ai_panel.update_recommendations(recommendation, top_job_ids)
+            self._ai_panel.update_recommendations(recommendation, top_job_ids, priority_levels)
             self._ai_panel.setVisible(True)
             self._ai_panel.raise_()  # Bring panel to front
-            self._ai_panel.update()  # Force UI update
-            self._ai_panel.repaint()  # Force repaint
-            self._append_log(f"AI panel visible: {self._ai_panel.isVisible()}")
-            self._append_log(f"AI panel size: {self._ai_panel.size().width()}x{self._ai_panel.size().height()}")
-            self._append_log(f"AI panel isHidden: {self._ai_panel.isHidden()}")
             
             # Force splitter to allocate space for the panel
             self._force_splitter_show_panel()
-            
-            # Additional check: ensure panel is not collapsed
-            if hasattr(self._ai_panel, '_collapse_btn'):
-                if self._ai_panel._collapse_btn.text() == "▶":  # If collapsed
-                    self._ai_panel._collapse_btn.click()  # Expand it
-                    self._append_log("Auto-expanded AI panel")
         
-        # Highlight AI picks in the table
-        self._highlight_ai_picks(top_job_ids)
+        # Highlight AI picks in the table with color coding
+        self._highlight_ai_picks_with_colors(top_job_ids, priority_levels)
         
-        # Auto-sort table to bring AI picks to top
-        self._resort_by_ai_picks(top_job_ids)
+        # Animate sorting to bring AI picks to top
+        self._animate_sort_by_ai_picks(top_job_ids)
         
-        self.statusBar().showMessage("AI recommendations ready - check right panel")
+        self.statusBar().showMessage("✨ AI recommendations ready - check right panel")
 
     def _on_recommend_error(self, error: str) -> None:
         """Handle AI recommendation error."""
@@ -1856,8 +2253,13 @@ class JobPipeMainWindow(QMainWindow):
         self._recommend_busy = False
         self._recommend_button.setEnabled(True)
 
-    def _highlight_ai_picks(self, job_ids: list[str]) -> None:
-        """Highlight the AI-picked rows with purple tint and badge."""
+    def _highlight_ai_picks_with_colors(self, job_ids: list[str], priority_levels: list[str]) -> None:
+        """Highlight AI-picked rows with color-coded priority levels.
+        
+        Args:
+            job_ids: List of AI-picked job IDs
+            priority_levels: List of 'high', 'medium', 'low' for color coding
+        """
         # Clear previous highlights
         for row in range(self._jobs_table.rowCount()):
             for col in range(self._jobs_table.columnCount()):
@@ -1869,23 +2271,100 @@ class JobPipeMainWindow(QMainWindow):
                         # Remove old badge if present
                         if "✨ AI Pick" in text:
                             item.setText(text.replace(" ✨ AI Pick", ""))
+                        if "🟢" in text:
+                            item.setText(text.replace(" 🟢", ""))
+                        if "🟡" in text:
+                            item.setText(text.replace(" 🟡", ""))
+                        if "🟣" in text:
+                            item.setText(text.replace(" 🟣", ""))
 
-        # Apply new highlights
-        ai_color = Qt.GlobalColor.cyan  # Light purple-ish tint
+        # Color mapping for priority levels
+        color_map = {
+            "high": QColor(76, 175, 80, 50),   # Green with transparency
+            "medium": QColor(255, 193, 7, 50),  # Yellow with transparency
+            "low": QColor(156, 39, 176, 50)     # Purple with transparency
+        }
+        emoji_map = {
+            "high": "🟢",
+            "medium": "🟡",
+            "low": "🟣"
+        }
+        
+        # Apply new highlights with color coding
         for row in range(self._jobs_table.rowCount()):
             item = self._jobs_table.item(row, 5)  # Title column has job ID
             if item:
                 job_id = item.data(Qt.ItemDataRole.UserRole)
                 if job_id in job_ids[:5]:  # Top 5 picks
-                    # Add purple tint to entire row
+                    idx = job_ids[:5].index(job_id)
+                    priority = priority_levels[idx] if idx < len(priority_levels) else "medium"
+                    color = color_map.get(priority, color_map["medium"])
+                    
+                    # Add colored tint to entire row
                     for col in range(self._jobs_table.columnCount()):
                         row_item = self._jobs_table.item(row, col)
                         if row_item:
-                            row_item.setBackground(ai_color)
-                    # Add badge to title
+                            row_item.setBackground(color)
+                    
+                    # Add colored badge to title
                     current_text = item.text()
-                    if "✨ AI Pick" not in current_text:
-                        item.setText(f"{current_text} ✨ AI Pick")
+                    emoji = emoji_map.get(priority, "🟡")
+                    if emoji not in current_text:
+                        item.setText(f"{current_text} {emoji} AI Pick")
+
+    def _animate_sort_by_ai_picks(self, job_ids: list[str]) -> None:
+        """Animate the table sorting to bring AI picks to the top.
+        
+        Uses a smooth animation effect by temporarily reordering rows.
+        """
+        if not job_ids or not hasattr(self, '_jobs_table'):
+            return
+        
+        # Get the table
+        table = self._jobs_table
+        
+        # Temporarily disable sorting to manually reorder
+        table.setSortingEnabled(False)
+        
+        # Create a mapping of job_id to row index
+        job_row_map = {}
+        for row in range(table.rowCount()):
+            item = table.item(row, 5)  # Title column
+            if item:
+                job_id = item.data(Qt.ItemDataRole.UserRole)
+                if job_id:
+                    job_row_map[job_id] = row
+        
+        # Animate by showing a status message
+        self.statusBar().showMessage("✨ Bringing AI picks to top...")
+        
+        # Use QTimer to create a simple animation effect
+        self._animation_step = 0
+        self._ai_job_ids = job_ids[:5]
+        self._animation_timer = QTimer(self)
+        self._animation_timer.timeout.connect(self._animation_step_callback)
+        self._animation_timer.start(100)  # Update every 100ms
+        
+        # After animation, re-enable sorting and sort by score
+        QTimer.singleShot(600, lambda: self._finish_animation())
+
+    def _animation_step_callback(self) -> None:
+        """Callback for animation steps."""
+        self._animation_step += 1
+        if self._animation_step >= 5:  # 5 steps = 500ms
+            if hasattr(self, '_animation_timer'):
+                self._animation_timer.stop()
+
+    def _finish_animation(self) -> None:
+        """Finish the animation and sort the table."""
+        if hasattr(self, '_animation_timer'):
+            self._animation_timer.stop()
+        
+        # Re-enable sorting and sort by Total score (column 0) descending
+        self._jobs_table.setSortingEnabled(True)
+        self._jobs_table.sortItems(0, Qt.SortOrder.DescendingOrder)
+        
+        self.statusBar().showMessage("✨ AI picks now at top of table")
 
     def _resort_by_ai_picks(self, job_ids: list[str]) -> None:
         """Auto-sort table to bring AI picks to the top."""
@@ -3080,7 +3559,10 @@ class JobPipeMainWindow(QMainWindow):
 
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self._log_output.appendPlainText(f"[{timestamp}] {message}")
+        log_message = f"[{timestamp}] {message}"
+        self._log_output.appendPlainText(log_message)
+        # Also output to Python logging for services.py debug messages
+        logging.debug(message)
 
 
 def launch_gui(settings: Settings) -> int:

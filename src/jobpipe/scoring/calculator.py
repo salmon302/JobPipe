@@ -32,6 +32,7 @@ class ScoreBreakdown:
     total: float
     details: str = ""  # Additional details about scoring
     confidence: str = "medium"  # "high", "medium", "low"
+    confidence_reason: str = ""  # Human-readable reason for confidence level
 
 
 @dataclass(frozen=True)
@@ -75,28 +76,34 @@ def compute_confidence(
     relevance_detail: str,
     attainability_detail: str,
     cv_parsed: bool = False,
-) -> str:
-    """Determine confidence level based on data quality."""
-    reasons: list[str] = []
-
-    if cv_parsed:
-        reasons.append("cv_parsed")
-    if "No CV sections" in relevance_detail or "No valid sections" in relevance_detail:
-        reasons.append("relevance_defaults")
-    if "No keywords" in relevance_detail:
-        reasons.append("no_keywords")
-    if "No domain" in relevance_detail:
-        reasons.append("no_domain")
-    if "No skills" in attainability_detail or "No education" in attainability_detail:
-        reasons.append("attainability_defaults")
+) -> tuple[str, str]:
+    """Determine confidence level and reason based on data quality.
+    
+    Returns:
+        Tuple of (confidence_level, confidence_reason) where confidence_level is
+        "high", "medium", or "low" and confidence_reason is a human-readable string.
+    """
+    issues: list[str] = []
 
     if not cv_parsed:
-        return "low"
-    if len(reasons) <= 1:
-        return "high"
-    if len(reasons) <= 3:
-        return "medium"
-    return "low"
+        return "low", "CV not parsed - using defaults"
+    
+    if "No CV sections" in relevance_detail or "No valid sections" in relevance_detail:
+        issues.append("CV sections unavailable")
+    if "No keywords" in relevance_detail:
+        issues.append("no skill keywords found")
+    if "No domain" in relevance_detail:
+        issues.append("could not determine domain")
+    if "No skills" in attainability_detail or "No education" in attainability_detail:
+        issues.append("incomplete background data")
+
+    if not issues:
+        return "high", "CV fully parsed with keyword and domain matches"
+    if len(issues) == 1:
+        return "medium", f"CV parsed but {issues[0]}"
+    if len(issues) <= 3:
+        return "medium", f"CV parsed but {len(issues)} data issues"
+    return "low", f"CV parsed but {len(issues)} significant data gaps"
 
 
 def compute_total_match_score(
@@ -105,8 +112,18 @@ def compute_total_match_score(
     recency: float,
     weights: ScoreWeights | None = None,
     confidence: str = "medium",
+    confidence_reason: str = "",
 ) -> ScoreBreakdown:
-    """Compute total match score with configurable weights."""
+    """Compute total match score with configurable weights.
+    
+    Args:
+        relevance: Relevance score [0, 1]
+        attainability: Attainability score [0, 1]
+        recency: Recency score [0, 1]
+        weights: Optional weight configuration
+        confidence: Confidence level ("high", "medium", "low")
+        confidence_reason: Human-readable reason for confidence level
+    """
     rel = _clamp01(relevance)
     att = _clamp01(attainability)
     rec = _clamp01(recency)
@@ -121,6 +138,7 @@ def compute_total_match_score(
     return ScoreBreakdown(
         relevance=rel, attainability=att, recency=rec,
         total=_clamp01(total), confidence=confidence,
+        confidence_reason=confidence_reason,
     )
 
 

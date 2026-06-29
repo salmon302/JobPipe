@@ -303,6 +303,48 @@ class GeminiClient:
 
         raise last_error or GeminiAPIError("Failed to generate text after retries")
 
+    def explain_job_score(
+        self,
+        job_title: str,
+        company: str,
+        job_description: str,
+        master_cv_summary: str,
+        score_breakdown: dict[str, float],
+    ) -> str:
+        """Generate a brief explanation for why a job received a particular score.
+
+        Args:
+            job_title: Title of the job position.
+            company: Company name.
+            job_description: Full job description text.
+            master_cv_summary: Brief summary of the user's background.
+            score_breakdown: Dict with 'total', 'relevance', 'attainability', 'recency' scores.
+
+        Returns:
+            Brief human-readable explanation of the score (1-2 sentences).
+
+        Raises:
+            GeminiAPIError: If the API call fails.
+        """
+        job_desc_preview = job_description[:500] if len(job_description) > 500 else job_description
+
+        prompt = f"""You are a job matching expert. Briefly explain (1-2 sentences max) why this job received the following score.
+
+Job Position: {job_title} at {company}
+Job Description Preview: {job_desc_preview}
+
+User Background: {master_cv_summary}
+
+Score Results:
+- Relevance: {score_breakdown.get('relevance', 0):.2f}/1.0 (skill/experience overlap)
+- Attainability: {score_breakdown.get('attainability', 0):.2f}/1.0 (seniority level match)
+- Recency: {score_breakdown.get('recency', 0):.2f}/1.0 (job freshness)
+- Total Match Score: {score_breakdown.get('total', 0):.2f}/1.0
+
+Provide a concise explanation suitable for a tooltip: why this score makes sense, and whether it's worth considering."""
+
+        return self.generate_text(prompt, temperature=0.2, max_output_tokens=150)
+
     def health_check(self) -> bool:
         """Check if Gemini API is accessible."""
         try:
